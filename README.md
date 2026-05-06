@@ -14,7 +14,7 @@ The full in-depth analysis, exploratory work, and any files that should remain l
 
 ## How To Use This Repository
 
-1. Open the project in RStudio or VS Code.
+1. Open the project in RStudio or Positron.
 2. Restore the R environment if a lockfile is provided.
 3. Place any required local-only input files in the expected paths.
 4. Run the scripts in `code/` in the documented order for the analysis you want to reproduce.
@@ -53,4 +53,4 @@ This workflow covers the antibiotic resistance gene analysis.
 - `ARG.qmd` uses the ARG count and feature tables in `data/rgi_combined/`, the mapping summary in `data/rgi_map_results/bam_stats.tsv`, and `Metadata/metadata_silas.csv`. It writes figures to `figures/` and summary outputs to `rgiresults/`.
 
 ---
-Simeon Streit, 06.05.2026, [Mail](simeonstreit@outlook.com)
+Simeon Streit, 06.05.2026
