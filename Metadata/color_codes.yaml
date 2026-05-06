@@ -1,0 +1,23 @@
+# Alternative brighter version
+sample_types:
+  Pigs: "#FF7FA5"  # Lighter bright pink
+  Pig_farmers: "#D4843D"  # Golden brown
+  Non_farmer_controls: "#4A7C7E"  # Bright teal/cyan
+
+pig_stages:
+  Suckling: "#FFC4DD"  # Light pink
+  Weaning: "#FF7FA5"  # Medium pink (matches main pig color)
+  Fattening: "#E63E7A"  # Dark pink
+
+category2:
+  Suckling_piglets: "#FFC4DD"  # Light pink
+  Older_pigs: "#FF7FA5"  # Lighter bright pink
+  Pig_farmers: "#D4843D"  # Golden brown
+  Non_farmer_controls: "#4A7C7E"  # Bright teal/cyan
+
+label_mapping:
+  Pigs: "Pigs"
+  Suckling_piglets: "Suckling\nPiglets"
+  Older_pigs: "Older Pigs"
+  Pig_farmers: "Pig Farmers"
+  Non_farmer_controls: "Non-farmer\nControls"

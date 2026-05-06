@@ -1,0 +1,1056 @@
+#Differential Abundance Analysis {#sec-diff-abundance-analysis}
+
+## Dependencies
+
+`utils.R` **-script**
+
+```{r}
+source("utils.R")
+```
+
+**Packages**
+
+```{r}
+#| echo: true
+#| message: false
+#| warning: false
+#| results: hide
+
+
+#devtools::install_github("gmteunisse/fantaxtic")
+#devtools::install_github("gmteunisse/ggnested")
+library(tidyverse)
+library(BiocManager)
+library(phyloseq)
+library(microViz)
+library(ggnested)
+library(vegan)
+library(matrixStats) #for 'colAnys'-function in'filter_species_by_group_prevalence'-function
+
+
+# for differential abundandce analysis
+library(ggrepel)
+library(EnhancedVolcano)
+library(dplyr)
+library(DESeq2)
+library(tibble)
+library(knitr)
+
+```
+
+**Color Palette**
+
+```{r - load color palette }
+# Load color codes from YAML file
+color_codes <- yaml::read_yaml("../../Metadata/color_codes.yaml")
+
+# Extract specific color palettes
+sample_type_colors <- unlist(color_codes$sample_types)
+pig_stage_colors <- unlist(color_codes$pig_stages)
+category2_colors <- unlist(color_codes$category2)
+```
+
+
+## Data: Loading and Filtering
+
+-   metaphlan estimated count data table
+
+```{r}
+# metaphlan raw read data (MF_SGB_abundance.txt)
+metaphlanData <- read.table("../data/raw/MF_SGB_abundance.txt", header = TRUE, sep = "")
+metaphlanData$clade_name <- as.character(metaphlanData$clade_name)
+metaData <- read.table("../../metadata/metadata_silas.csv", header = TRUE, sep = ",") %>%
+  column_to_rownames(var = "id")
+
+# name the rows according to the sample names
+rownames(metaData) <- metaData$Sample_name
+
+# assigns 0 to all NA's in my metaphlan data table
+metaphlanData[is.na(metaphlanData)] <- 0
+
+```
+
+-   filtering of all duplicated samples (ppB)
+
+```{r}
+# metaphlanData
+metaphlanData <- metaphlanData[, !grepl("ppB", colnames(metaphlanData))]
+
+```
+
+### Metaphlan Annotation table
+```{r}
+library(dplyr)
+library(tidyr)
+
+meta_annot <- metaphlanData %>%           # one row per taxon/SGB
+  separate(clade_name,
+           into = c("Kingdom","Phylum","Class","Order",
+                    "Family","Genus","Species","SGB"),
+           sep = "\\|",
+           fill = "right",
+           remove = FALSE)
+
+# clean the prefixes
+for (col in c("Kingdom","Phylum","Class","Order","Family","Genus","Species","SGB")) {
+  meta_annot[[col]] <- sub("^[a-z]__", "", meta_annot[[col]])
+}
+
+# save as csv
+sgb_annot <- meta_annot %>%
+  select(c("clade_name", "Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species", "SGB", "clade_taxid"))
+
+write.csv(sgb_annot, "../../Metadata/sgb_annotation.csv", row.names = F)
+
+```
+
+
+## Phyloseq-Object
+
+```{r}
+meta_physeq <- metaphlan_to_phyloseq(metaphlanData, metaData, version = 4, verbose = TRUE, tax_lvl = "SGB")
+
+ps <- meta_physeq
+ps <- subset_taxa(ps, Kingdom !="UNKNOWN") # remove the unknowns
+
+#View(ps@tax_table@.Data)
+
+ps@tax_table@.Data <- substring(ps@tax_table@.Data, 4)
+taxa_names(ps) <- substring(taxa_names(ps), 4)
+colnames(ps@tax_table@.Data)<- c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species", "SGB")
+```
+
+### filter phyloseq object
+```{r}
+ps_filt <- filter_taxa(
+    ps,
+    function(x) mean(x) > 1e-5,
+    prune = TRUE
+)
+
+ps <- ps_filt
+```
+
+## Differential Abundance Analysis SGB-Level by Category (PIG | FARMER | CTRL)
+
+Conditions before running differential abundance analysis
+
+-   filter suckling pigs that we exclude them from my analysis
+-   remove all NA, in order DESeq2 will work
+
+```{r}
+otu <- otu_table(ps)
+otu[is.na(otu)] <- 0
+
+otu_table(ps) <- otu_table(otu, taxa_are_rows = TRUE)
+
+#check if no NA value is lost ?
+assertthat::assert_that(!any(is.na(otu_table(ps))))
+
+# -- FALSE: any NA exists
+# -- TRUE: no NA exists
+```
+
+run DESeq2: set reference first to *WORKER* in order to make the following comparisons:
+Do this on the species level
+
+-   A: PIG / WORKER
+
+-   B: CTRL / WORKER
+
+```{r}
+# aggregate species level -> useful when we want to aggregate not on the lowest taxonomy level
+phy_species <- tax_glom(ps, taxrank = "SGB" )
+
+# force animal to be a factor explicitly
+sample_data(phy_species)$category <- as.factor(sample_data(phy_species)$category)
+
+# add a pseudocount of +1 (eliminate of 0 which causes problems and NA-values)
+otu_table(phy_species) <- otu_table(otu_table(phy_species)+1)
+
+# start differential abundance
+dds <- phyloseq_to_deseq2(phy_species, ~category)
+dds <- DESeq(dds)
+
+# store DESeq element
+saveRDS(dds, file = "../data/processed/dds_species.rds")
+```
+
+the analysis consist of mainly three plots:
+
+1.  Volcano Plot
+
+2.  MA-Plot with baseMean data
+
+    very similar to volcano plot but instead of showing the x-axis we show
+
+3.  Volcano plot with species of interest (depending on the comparison we are looking at).
+
+### A: PIG / WORKER
+
+this is the main comparison in our analysis. We assume (also based on the ordination analysis aka $bata$ diversity measure) that we see a difference in clustering of pig and worker samples. Thus, there have to be microbial species in either of both hosts driving this significant difference. In order to visualize which species are significantly different between both hosts, we use differential abundance analysis. This results in a volcano plot, where all red species are significantly different between both hosts, while the black species are not.
+
+#### Volcano Plot
+
+```{r}
+res_pig_vs_farmers <- results(dds, contrast = c("category", "Pigs", "Pig_farmers"))
+
+# merge with taxonomy
+res_pig_vs_farmers <- as.data.frame(res_pig_vs_farmers)
+res_pig_vs_farmers$SGB <- rownames(res_pig_vs_farmers)
+
+
+tax <- as.data.frame(tax_table(phy_species))
+tax$SGB <- rownames(tax)
+
+res_merged <- merge(res_pig_vs_farmers, tax, by = "SGB")
+
+res_merged$label_genus   <- res_merged$Genus
+res_merged$label_species <- res_merged$Species
+
+library(ggrepel)
+volcano_human_pig <- exp_volcano(res_merged, "Pigs vs. Pig_farmers")
+
+# add species to the annotation of datapoints
+volcano_human_pig <- volcano_human_pig +
+  geom_text_repel(
+    data = subset(res_merged, padj < 0.05 & abs(log2FoldChange) > 1),
+    aes(x = log2FoldChange,
+        y = -log10(padj),
+        label = label_genus),
+    size = 2,
+    max.overlaps = 10
+  ) +
+  xlab(expression(Log[2]~"FoldChange (WORKERS vs PIGS)"))
+
+print(volcano_human_pig)
+```
+
+#### MA-Plot
+
+```{r}
+# Ensure the object exists even if chunks are run out of order
+if (!exists("res_pig_vs_farmers")) {
+  res_pig_vs_farmers <- results(dds, contrast = c("category", "Pigs", "Pig_farmers"))
+}
+
+res_df_human_vs_pig <- as.data.frame(res_pig_vs_farmers)
+
+# add a significance level
+res_df_human_vs_pig <- res_df_human_vs_pig %>%
+  mutate(significance = case_when(
+    padj < 0.05 & abs(log2FoldChange) >= 1 ~ "Significant",
+    TRUE ~ "Not Significant"
+  ))
+# plot with base mean
+ggplot(data = res_df_human_vs_pig, aes(y = log10(baseMean), x = log2FoldChange, color = significance)) +
+  geom_point(alpha = 0.8) +
+  scale_color_manual(values= c("Significant" = "grey", "Not Significant" = "black"))+
+  labs(
+    title = "Base Mean vs Log2 Fold Change (Workers vs Pigs)", 
+    x = "Log2 Fold Change", 
+    y = "Base Mean")+
+  theme_minimal()
+```
+
+#### Species of interest
+
+this comparison is relevant since we are looking for non-significant species with a p-value \> 0.05 and Log2FC-value of between -1 and 1.
+
+→ we are interested in the **black** species in the [MA-Plot].
+
+```{r}
+# Define shared species between pigs and workers
+
+df_workers_vs_pig <- res_df_human_vs_pig %>%
+  filter(baseMean > 10) %>% # filter for species with a base mean > 10
+  filter(padj > 0.05) %>% # filter for non-significant species
+  filter(abs(log2FoldChange) <= 1) # filter for species with a log2FoldChange between -1 and 1
+# view(df_workers_vs_pig)
+```
+
+### B: Farmers / Controls {#b-ctrl-worker}
+
+this comparison is relevant since we are using the ctrl group in order to validate our hypothesis, that certain pig species are transmitted / shared between pigs and workers and not the control group. This analysis emphasizes also that the worker group most probably have a microbiome, more similar to pigs.
+
+#### Volcano Plot
+
+```{r}
+res_farmer_vs_ctrl <- results(dds, contrast = c("category","Pig_farmers", "Non_farmer_controls"))
+
+#merge with taxonomy
+res_farmer_vs_ctrl <- as.data.frame(res_farmer_vs_ctrl)
+res_farmer_vs_ctrl$SGB <- rownames(res_farmer_vs_ctrl)
+
+tax <- as.data.frame(tax_table(phy_species))
+tax$SGB <- rownames(tax)
+
+res_farmer_vs_ctrl <- merge(res_farmer_vs_ctrl, tax, by = "SGB")
+volcano_human_ctrl <- exp_volcano(res_farmer_vs_ctrl, "Farmers vs. CTRLs")
+volcano_human_ctrl <- volcano_human_ctrl + xlab(expression(Log[2]~"Fold Change (CTRL vs. FARMERS)"))
+print(volcano_human_ctrl)
+```
+
+#### MA-Plot
+
+```{r}
+# add a significance level
+res_farmer_vs_ctrl <- res_farmer_vs_ctrl %>%
+  mutate(significance = case_when(
+    padj < 0.05 & abs(log2FoldChange) >= 1 ~ "Significant",
+    TRUE ~ "Not Significant"
+  ))
+
+# plot MA plot
+ggplot(data = res_farmer_vs_ctrl, aes(x = log2FoldChange, y = log10(baseMean), color = significance)) +
+  geom_point(alpha = 0.8) +
+  scale_color_manual(values= c("Significant" = "red", "Not Significant" = "grey"))+
+  labs(
+    title = "MA Plot: Farmers vs Controls", 
+    x = "Log2 Fold Change (Controls vs Farmers)", 
+    y = "Log10 Base Mean") +
+  theme_minimal()
+```
+
+#### Species of interest
+
+*grey species:* the same between workers and ctrls → species which are common in the microbiome.
+
+*red species:* species which are different in the microbiome between human and ctrls.
+
+### C: PIG / CTRL
+
+#### Volcano Plot
+
+set new reference ctrl for pig vs. ctrl. comparison
+
+```{r}
+res_ctrls_vs_pig <- results(dds, contrast = c("category", "Pigs", "Non_farmer_controls"))
+
+# merge with taxonomy
+res_df_ctrls <- as.data.frame(res_ctrls_vs_pig)
+res_df_ctrls$SGB <- rownames(res_df_ctrls)
+
+tax <- as.data.frame(tax_table(phy_species))
+tax$SGB <- rownames(tax)
+
+res_merged_ctrls <- merge(res_df_ctrls, tax, by = "SGB")
+volcano_ctrls_pig <- exp_volcano(res_merged_ctrls, "pigs vs. ctrls")
+volcano_ctrls_pig <- volcano_ctrls_pig + xlab(expression(Log[2]~"Fold Change (Pig vs ctrls)"))
+print(volcano_ctrls_pig)
+```
+
+#### MA-Plot
+
+```{r}
+# add a significance level
+res_ctrls_vs_pig <- res_merged_ctrls %>%
+  mutate(significance = case_when(
+    padj < 0.05 & abs(log2FoldChange) >= 1 ~ "Significant",
+    TRUE ~ "Not Significant"
+  
+  ))
+
+
+# plot MA plot
+ggplot(data=res_ctrls_vs_pig, aes(x = log2FoldChange, y = log10(baseMean), color = significance)) +
+  geom_point(alpha = 0.8) +
+  scale_color_manual(values= c("Significant" = "grey", "Not Significant" = "black"))+
+  labs(
+    title = "MA Plot: Ctrls vs Pigs", 
+    x = "Log2 Fold Change (Ctrls vs. Pigs)", 
+    y = "Log10 Base Mean") +
+  theme_minimal()
+```
+
+#### Species of interest
+
+```{r}
+# find interesting species which are significantly different between the ctrls. and the pigs  
+df_ctrls_vs_pigs <- res_ctrls_vs_pig %>%
+  filter(baseMean > 10) %>% # filter for species with a base mean > 10
+  filter(padj < 0.05) %>% # filter for significant species
+  filter(log2FoldChange <= -1) # filter for species with a log2FoldChange specific for the pigs (log2FoldChange < -1)
+```
+
+
+## Log2FC-Analysis
+
+```{r}
+library(tidyverse)
+
+# PIG > CTRL
+res_pig_vs_ctrl_df <- as.data.frame(res_ctrls_vs_pig)
+if (!"SGB" %in% colnames(res_pig_vs_ctrl_df)) {
+  res_pig_vs_ctrl_df$SGB <- rownames(res_pig_vs_ctrl_df)
+}
+res_pig_vs_ctrl_df <- res_pig_vs_ctrl_df %>%
+  dplyr::rename(
+    log2FC_PIG_CTRL   = log2FoldChange,
+    padj_PIG_CTRL     = padj,
+    baseMean_PIG_CTRL = baseMean
+  ) %>%
+  dplyr::select(SGB, log2FC_PIG_CTRL, padj_PIG_CTRL, baseMean_PIG_CTRL)
+
+# PIG FARMER > CTRL
+res_farmer_vs_ctrl_df <- as.data.frame(res_farmer_vs_ctrl)
+if (!"SGB" %in% colnames(res_farmer_vs_ctrl_df)) {
+  res_farmer_vs_ctrl_df$SGB <- rownames(res_farmer_vs_ctrl_df)
+}
+res_farmer_vs_ctrl_df <- res_farmer_vs_ctrl_df %>%
+  dplyr::rename(
+    log2FC_PIGFARMER_CTRL   = log2FoldChange,
+    padj_PIGFARMER_CTRL     = padj,
+    baseMean_PIGFARMER_CTRL = baseMean
+  ) %>%
+  dplyr::select(SGB, log2FC_PIGFARMER_CTRL, padj_PIGFARMER_CTRL, baseMean_PIGFARMER_CTRL)
+
+# Merge both contrasts by SGB; keep only SGBs present in both
+res_both <- res_pig_vs_ctrl_df %>%
+  full_join(res_farmer_vs_ctrl_df, by = "SGB") %>%
+  filter(!is.na(log2FC_PIG_CTRL) & !is.na(log2FC_PIGFARMER_CTRL))
+
+# store res_both
+write.csv(res_both, file ="../data/processed/differential_abundance_log2_comparison.csv", row.names = FALSE)
+
+# Genes/SGBs significantly changed in both comparisons (|log2FC| > 1, padj < 0.05, baseMean >= 1)
+res_lab1 <- res_both %>%
+  filter(log2FC_PIG_CTRL > 1,
+         log2FC_PIGFARMER_CTRL > 1,
+         padj_PIG_CTRL < 0.05,
+         padj_PIGFARMER_CTRL < 0.05,
+         baseMean_PIG_CTRL >= 1)
+
+# top 10 SGBs in both comparisons
+res_top_10 <- res_lab1 %>%
+  left_join(meta_annot %>% select(SGB, Family, Genus, Species), by = "SGB") %>%
+  arrange(desc(log2FC_PIG_CTRL), desc(log2FC_PIGFARMER_CTRL)) %>%
+  slice_head(n = 10)
+
+# export top 10 SGBs
+write.csv(res_top_10, file = "../data/processed/top_10_SGBs_log2FC_both_comparisons.csv", row.names = FALSE)
+
+
+print(res_top_10)
+
+# Strongly differentially abundant in both (example threshold)
+res_lab2 <- res_both %>%
+  filter(log2FC_PIG_CTRL > 10,
+         log2FC_PIGFARMER_CTRL > 10) %>%
+  left_join(meta_annot %>% select(SGB, Family, Genus, Species), by = "SGB") %>%
+  filter(!grepl("^FGB", Family)) %>%  # Exclude unknown species starting with "FGB" on the family level
+  slice_head(n = 20)
+
+# scatter plot
+library(ggrepel)
+
+scatterplot_SGB <- ggplot(res_both,
+                          aes(x = log2FC_PIG_CTRL,
+                              y = log2FC_PIGFARMER_CTRL)) +
+  geom_point(alpha = 0.4) +
+  geom_point(data = res_lab1, colour = "red") +
+  geom_point(data = res_lab2, colour = "#8B0000") +
+  geom_vline(xintercept = c(-1, 1), colour = "black", linetype = "dashed") +
+  geom_hline(yintercept = c(-1, 1), colour = "black", linetype = "dashed") +
+  geom_text_repel(
+    data = res_lab2,
+    aes(label = Family),         # or label = Label if you added species/genus above
+    max.overlaps = 50,
+    box.padding = 0.3,
+    size = 6
+  ) +
+  theme_bw(base_family = "DejaVu Sans") +
+  xlab("Log2FC | CTRL < PIG") +
+  ylab("Log2FC | CTRL < PIG FARMER")+
+  theme_publication()
+
+plot(scatterplot_SGB)
+
+# save the plot
+ggsave("../figures/log2FC_scatterplot_SGB.svg",
+       plot = scatterplot_SGB,
+       width = 10,
+       height = 8,
+       dpi = 300)
+
+```
+
+
+
+## Joint Comparison of A: PIG/WORKER and B: CTRL/WORKER
+
+**AIM**: find relevant species in pig and workers but not in ctrls
+
+**Idea**: find the non-significant species in the pig / workers comparison (grey dots) which are not in the [B: CTRL / WORKER](#b-ctrl-worker) comparison.
+
+**Hypothesis:** we should actually see species specific for pig and workers (which are potentially transmitted or shared) in the workers but not in the ctrls.
+
+**Workflow**:
+
+1.  Visualize all species which are non significant in comparison A: PIG/WORKER in the B:CTRL/WORKER
+2.  highlight all interesting species from A: PIG/WORKER in B:CTRL/WORKER
+
+```{r}
+# take ctrl worker comparison and make a data-frame
+df_ctrls_vs_workers <- as.data.frame(res_human_vs_ctrl)
+#rownames to column
+df_ctrls_vs_workers <- rownames_to_column(df_ctrls_vs_workers, var = "SGB")
+
+# mutate df_workers_vs_pig
+# mark all interesting species with 'yes'
+df_workers_vs_pig <- df_workers_vs_pig %>%
+  mutate(interesting = "yes")
+
+# merge both dataframe (innerjoin)
+df_species_interesting_A <- dplyr::full_join(df_workers_vs_pig, df_ctrls_vs_workers, by = "SGB", suffix = c("_pw", "_cw"))
+
+# adapt the dataframe so that all species which are not interesting 'no'
+df_species_interesting_A <- df_species_interesting_A %>%
+  mutate(interesting = if_else(is.na(interesting), "no", interesting))
+```
+
+plot
+
+```{r}
+# make a MA plot with visualising species of interest
+ggplot(data = df_species_interesting_A, aes(x = log2FoldChange_cw, y = log10(baseMean_cw), color = interesting))+
+  geom_point(alpha = 1)+
+  scale_color_manual(values = c("no" = "grey", "yes" = "darkgreen"))+
+  labs(
+    title = "Species of interest from non-significant species in comparison to workers/ctrls",
+    x = "Log2FoldChange (ctrls vs worker)",
+    y = "log10 BaseMean (ctrls vs workers)"
+  )+
+  theme(plot.title = element_text(size = 10))+
+      theme_minimal()
+```
+
+**Interpretation of plot**:\
+the plot shows the *ctrls vs worker* comparison.
+
+-   right side of the plot: all species which are more present in the ctrls (since positive Log2FC-value)
+
+-   left side of the plot: all species which are more present in the workers (since negative Log2FC-value)
+
+the green points represent the species, which are not significantly different between workers and pigs. So we are finally looking at the species, which are non-significant between worker and pigs and also not present in ctrls --> *so actually the species which we are intersted in*.
+
+-\> so we are now actually interested in the species on the left side of this plot (Log2FC \< -1) , which are grey. Because those are the species, being not significantly different between pigs and humans but not to be find in ctrls.
+
+#### final non-significant species (nonsig_sgb)
+
+```{r}
+df_species_nonsig_pigs_workers_not_in_ctrls <- df_species_interesting_A %>%
+  filter(baseMean_cw > log10(1) & log2FoldChange_cw <= -1 & interesting == "yes") %>%
+  select(-c(baseMean_pw, log2FoldChange_pw, lfcSE_pw, stat_pw, pvalue_pw,padj_pw))
+
+head(df_species_nonsig_pigs_workers_not_in_ctrls)
+
+# vector of interesting species 
+A <- df_species_nonsig_pigs_workers_not_in_ctrls %>%
+  pull("SGB")
+
+nonsig_sgb <- A
+
+cat("Result:", length(A), "interesting species, which are non-significantly different in pigs vs workers and also not found in ctrls")
+
+# store nonsig_sgb in a .csv-file
+write.csv(nonsig_sgb, file = "../data/processed/nonsig_sgb.csv", row.names = FALSE)
+```
+
+### E: Joint Comparison of A: PIG/WORKER in C: PIG/CTRL
+
+
+```{r}
+# take ctrl worker comparison and make a data-frame
+df_pig_vs_ctrls <- as.data.frame(res_df_ctrls)
+
+# merge both dataframe (innerjoin)
+df_species_interesting_B <- dplyr::full_join(df_workers_vs_pig, df_pig_vs_ctrls, by = "SGB")
+
+
+
+
+df_species_interesting_B <- df_species_interesting_B %>%
+  mutate(interesting = if_else(is.na(interesting), "no", interesting))
+
+
+head(df_species_interesting_B)
+```
+
+plot
+
+```{r}
+# make a MA plot with visualising species of interest
+ggplot(data = df_species_interesting_B, aes(x = log2FoldChange.y, y = log10(baseMean.y), color = interesting))+
+  geom_point(alpha = 1)+
+  scale_color_manual(values = c("no" = "palevioletred1", "yes" = "grey"))+
+  labs(
+    title = "Species of interest from non-significant species in comparison pigs /ctrls",
+    x = "Log2FoldChange (ctrls vs pigs)",
+    y = "log10 BaseMean (ctrls vs pigs)"
+  )+
+  theme(plot.title = element_text(size = 10))+
+      theme_minimal()
+```
+
+## Differential Abundance Olderpigs and Sucklings piglets
+```{r}
+dds_2 <- phyloseq_to_deseq2(phy_species, ~category2)
+dds_2 <- DESeq(dds_2)
+
+# turn category2 into a factor and check levels
+colData(dds)$category2 <- factor(colData(dds)$category2)
+levels(colData(dds)$category2)
+
+```
+
+### Older vs. Suckling piglets
+```{r}
+res_older_vs_sucklings <- results(dds_2,
+                                  contrast = c("category2",
+                                               "Older_pigs",
+                                               "Suckling_piglets"))
+
+
+# dataframe for older pigs vs suckling piglets
+res_older_vs_sucklings_df <- as.data.frame(res_older_vs_sucklings
+) %>%
+  tibble::rownames_to_column("SGB") %>%
+  dplyr::rename(
+    log2FC_OLDER_SUCKLING   = log2FoldChange,
+    padj_OLDER_SUCKLING     = padj,
+    baseMean_OLDER_SUCKLING = baseMean
+  )
+
+# volcano plot
+volcano_older_vs_sucklings <- ggplot(res_older_vs_sucklings_df,
+                                      aes(x = log2FC_OLDER_SUCKLING,
+                                          y = -log10(padj_OLDER_SUCKLING))) +
+  geom_point(alpha = 0.4) +
+  theme_bw(base_family = "DejaVu Sans") +
+  xlab("Log2FC | Sucklings Piglets < Older Pigs") +
+  ylab("-Log10 adjusted p-value")
+
+print(volcano_older_vs_sucklings)
+```
+### Older pigs vs farmers and older pigs vs non-farmer controls
+```{r}
+
+library(dplyr)
+library(ggplot2)
+library(ggrepel)
+
+# older pigs > farmers
+res_older_vs_farmers <- results(dds_2,
+                                  contrast = c("category2",
+                                               "Older_pigs",
+                                               "Pig_farmers"))
+
+# older pigs > ctrls
+res_older_vs_ctrls <- results(dds_2,
+                                  contrast = c("category2",
+                                               "Older_pigs",
+                                               "Non_farmer_controls"))
+
+# --- log2FC scatterplot ---
+
+# dataframe for older pigs vs farmers
+res_older_vs_farmers_df <- as.data.frame(res_older_vs_farmers) %>%
+  tibble::rownames_to_column("SGB") %>%
+  dplyr::rename(
+    log2FC_OLDER_FARMER   = log2FoldChange,
+    padj_OLDER_FARMER     = padj,
+    baseMean_OLDER_FARMER = baseMean
+  )
+
+# daataframe for older pigs vs ctrls
+res_older_vs_ctrls_df <- as.data.frame(res_older_vs_ctrls) %>%
+  tibble::rownames_to_column("SGB") %>%
+  dplyr::rename(
+    log2FC_OLDER_CTRL   = log2FoldChange,
+    padj_OLDER_CTRL     = padj,
+    baseMean_OLDER_CTRL = baseMean
+  )
+# Merge both contrasts by SGB; keep only SGBs present in both
+res_older_both <- res_older_vs_farmers_df %>%
+  full_join(res_older_vs_ctrls_df, by = "SGB") %>%
+  filter(!is.na(log2FC_OLDER_FARMER) & !is.na(log2FC_OLDER_CTRL))
+
+
+# -- identify interesting SGBs -- #
+# SGBs significantly higher in older pigs in BOTH contrasts
+res_older_lab1 <- res_older_both %>%
+  filter(log2FC_OLDER_FARMER > 1 & padj_OLDER_CTRL < 0.05)
+
+
+
+
+# scatter plot Older pigs vs farmers and ctrls
+scatterplot_older_SGB <- ggplot(res_older_both,
+                          aes(x = log2FC_OLDER_FARMER,
+                              y = log2FC_OLDER_CTRL)) +
+  geom_point(alpha = 0.4, color = "grey70") +
+  geom_point(data = res_older_lab1,
+             aes(x = log2FC_OLDER_FARMER,
+                 y = log2FC_OLDER_CTRL,
+                 colour = "#E63E7A")) +
+  geom_vline(xintercept = c(-1, 1), colour = "black", linetype = "dashed") +
+  geom_hline(yintercept = c(-1, 1), colour = "black", linetype = "dashed") +
+  theme_bw(base_family = "DejaVu Sans") +
+  xlab("Log2FC | FARMER < OLDER PIG") +
+  ylab("Log2FC | CTRL < OLDER PIG")+
+  theme(
+    legend.position = "none"
+  )
+
+
+print(scatterplot_older_SGB)
+
+```
+```{r}
+# save this plot
+ggsave("../figures/log2FC_scatterplot_older_SGB.svg",
+       plot = scatterplot_older_SGB,
+       width = 10,
+       height = 6,
+       dpi = 300)
+```
+
+```{r}
+# scatterplot OLDER PIG > FARMER  / OLDER PIG > CTRL
+
+# Merge both contrasts by SGB; keep only SGBs present in both
+res_older_both_2 <- res_older_vs_farmers_df %>%
+  full_join(res_farmer_vs_ctrl_df, by = "SGB") %>%
+  filter(!is.na(log2FC_OLDER_FARMER) & !is.na(log2FC_PIGFARMER_CTRL))
+
+# scatter plot Older pigs vs farmers and ctrls
+scatterplot_older_SGB_2 <- ggplot(res_older_both_2,
+                          aes(x = log2FC_OLDER_FARMER,
+                              y = log2FC_PIGFARMER_CTRL)) +
+  geom_point(alpha = 0.4, color = "grey70") +
+  geom_vline(xintercept = c(-1, 1), colour = "black", linetype = "dashed") +
+  geom_hline(yintercept = c(-1, 1), colour = "black", linetype = "dashed") +
+  theme_bw(base_family = "DejaVu Sans") +
+  xlab("Log2FC | FARMER < OLDER PIG") +
+  ylab("Log2FC | CTRL < FARMER")+
+  theme(
+    legend.position = "none"
+  )
+print(scatterplot_older_SGB_2)
+
+```
+```{r}
+# CTRL < group on both axes plot
+
+res_older_vs_ctrls <- results(dds_2,
+  contrast = c("category2","Older_pigs","Non_farmer_controls"))  # OLDER vs CTRL
+
+res_farmer_vs_ctrl  <- results(dds,
+  contrast = c("category","Pig_farmers","Non_farmer_controls"))  # FARMER vs CTRL
+
+# rename the contrasts accordingly
+res_older_vs_ctrls <- data.frame(res_older_vs_ctrls) %>%
+  dplyr::rename(
+    log2FC_OLDER_CTRL   = log2FoldChange,
+    padj_OLDER_CTRL     = padj,
+    baseMean_OLDER_CTRL = baseMean
+  )
+
+res_farmer_vs_ctrl <- data.frame(res_farmer_vs_ctrl) %>%
+  dplyr::rename(
+    log2FC_FARMER_CTRL   = log2FoldChange,
+    padj_FARMER_CTRL     = padj,
+    baseMean_FARMER_CTRL = baseMean
+  )
+
+
+
+# Merge both contrasts by SGB; keep only SGBs present in both
+res_older_both_3 <- as.data.frame(res_older_vs_ctrls) %>%
+  tibble::rownames_to_column("SGB") %>%
+  full_join(
+    as.data.frame(res_farmer_vs_ctrl) %>%
+      tibble::rownames_to_column("SGB"),
+    by = "SGB"
+  ) %>%
+  filter(!is.na(log2FC_OLDER_CTRL) & !is.na(log2FC_FARMER_CTRL))
+
+
+# significant in both comparisons (example thresholds)
+older_farmer_sig <- res_older_both_3 %>%
+  filter(log2FC_OLDER_CTRL   > 1,
+         log2FC_FARMER_CTRL  > 1,
+         padj_OLDER_CTRL     < 0.05,
+         padj_FARMER_CTRL    < 0.05)
+
+
+
+# top 20 most significant by combined padj
+top20_lab <- older_farmer_sig %>%
+  mutate(padj_combined = pmax(padj_OLDER_CTRL, padj_FARMER_CTRL, na.rm = TRUE)) %>%
+  arrange(padj_combined) %>%
+  slice_head(n = 20) %>%
+  left_join(meta_annot %>% select(SGB, Genus), by = "SGB")%>%
+  filter(!grepl("^GGB", Genus))  # Exclude unknown species starting with "GGB"
+
+
+# scatter plot Older pigs vs farmers and ctrls
+scatterplot_older_SGB_3 <- ggplot(res_older_both_3,
+                          aes(x = log2FC_OLDER_CTRL,
+                              y = log2FC_FARMER_CTRL)) +
+  geom_point(alpha = 0.4, color = "grey70") +
+  geom_point(data = older_farmer_sig,
+             aes(x = log2FC_OLDER_CTRL,
+                 y = log2FC_FARMER_CTRL,
+                 colour = "#FF7FA5")) +
+  geom_text_repel(
+    data = top20_lab,
+    aes(x = log2FC_OLDER_CTRL,
+        y = log2FC_FARMER_CTRL,
+        label = Genus),
+    max.overlaps = 50
+  ) +
+  geom_vline(xintercept = c(-1, 1), colour = "black", linetype = "dashed") +
+  geom_hline(yintercept = c(-1, 1), colour = "black", linetype = "dashed") +
+  theme_bw(base_family = "DejaVu Sans") +
+  xlab("Log2FC | CTRL < OLDER PIG") +
+  ylab("Log2FC | CTRL < FARMER")+
+  theme(
+    legend.position = "none"
+  )
+print(scatterplot_older_SGB_3)
+
+# save this plot
+ggsave("../figures/log2FC_scatterplot_older_SGB.svg",
+       plot = scatterplot_older_SGB_3,
+       width = 8,
+       height = 6,
+       dpi = 300)
+
+
+
+```
+## Barplot of significant species in the different comparisons
+### phylum level
+```{r}
+library(dplyr)
+library(ggplot2)
+
+res_both <- res_both %>%
+  left_join(meta_annot, by = "SGB")
+
+# combine p-values for a taxon across both contrasts and all member SGBs
+combine_p_fisher <- function(pvals) {
+  pvals <- pvals[is.finite(pvals) & !is.na(pvals)]
+  pvals <- pmax(pvals, 1e-300)
+  if (length(pvals) == 0) return(NA_real_)
+  stat <- -2 * sum(log(pvals))
+  pchisq(stat, df = 2 * length(pvals), lower.tail = FALSE)
+}
+
+p_to_stars <- function(p) {
+  case_when(
+    p < 0.001 ~ "***",
+    p < 0.01  ~ "**",
+    p < 0.05  ~ "*",
+    p < 0.10  ~ ".",
+    TRUE ~ "ns"
+  )
+}
+
+phylum_col <- if ("Phylum" %in% names(res_both)) "Phylum" else "Phylum.x"
+family_col <- if ("Family" %in% names(res_both)) "Family" else "Family.x"
+
+# top enriched phyla
+res_both__phylum <- res_both %>%
+  filter(log2FC_PIG_CTRL >  1 & 
+         log2FC_PIGFARMER_CTRL > 1 & 
+         padj_PIG_CTRL < 0.05 & 
+         padj_PIGFARMER_CTRL < 0.05) %>%
+  group_by(Phylum = .data[[phylum_col]]) %>%
+  summarise(
+    mean_baseMean_PIG_CTRL      = mean(baseMean_PIG_CTRL),
+    mean_baseMean_PIGFARMER_CTRL = mean(baseMean_PIGFARMER_CTRL),
+    p_phylum = combine_p_fisher(c(padj_PIG_CTRL, padj_PIGFARMER_CTRL)),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    mean_baseMean_both = (mean_baseMean_PIG_CTRL + mean_baseMean_PIGFARMER_CTRL) / 2,
+    q_phylum = p.adjust(p_phylum, method = "BH"),
+    sig_label = p_to_stars(q_phylum)
+  ) %>%
+  arrange(desc(mean_baseMean_both))
+
+
+top10_phylum <- res_both__phylum %>%
+  slice_head(n = 10)
+
+print(top10_phylum)
+
+str(top10_phylum)
+
+
+# barplot phylum level
+bar_top10_phylum <- ggplot(
+  top10_phylum,
+  aes(x = reorder(Phylum, mean_baseMean_both),
+      y = mean_baseMean_both)
+) +
+  geom_col(fill = "#4A7C7E") +
+  geom_text(aes(y = mean_baseMean_both * 1.03, label = sig_label),
+            family = "DejaVu Sans", size = 4, hjust = 0) +
+  coord_flip() +
+  theme_bw(base_family = "DejaVu Sans") +
+  xlab("Phylum") +
+  ylab("Mean abundance (PIG & PIG FARMER vs CTRL)") +
+  labs(title = "Top 10 most enriched phyla") +
+  scale_y_continuous(expand = expansion(mult = c(0.02, 0.12))) +
+  theme(
+    axis.text  = element_text(size = 11),
+    axis.title = element_text(size = 12)
+  )
+
+
+print(bar_top10_phylum)
+
+# save this plot
+ggsave("../figures/barplot_top_phyla.svg", plot = bar_top10_phylum, height = 6, width = 8, device = svg)
+
+# top enriched families
+res_both__family <- res_both %>%
+  filter(log2FC_PIG_CTRL >  1,
+         log2FC_PIGFARMER_CTRL > 1,
+         padj_PIG_CTRL < 0.05,
+         padj_PIGFARMER_CTRL < 0.05,
+         !is.na(.data[[family_col]])) %>%
+  group_by(Family = .data[[family_col]]) %>%
+  summarise(
+    mean_baseMean_PIG_CTRL       = mean(baseMean_PIG_CTRL, na.rm = TRUE),
+    mean_baseMean_PIGFARMER_CTRL = mean(baseMean_PIGFARMER_CTRL, na.rm = TRUE),
+    p_family = combine_p_fisher(c(padj_PIG_CTRL, padj_PIGFARMER_CTRL)),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    mean_baseMean_both = (mean_baseMean_PIG_CTRL + mean_baseMean_PIGFARMER_CTRL) / 2,
+    q_family = p.adjust(p_family, method = "BH"),
+    sig_label = p_to_stars(q_family)
+  ) %>%
+  arrange(desc(mean_baseMean_both))
+
+top10_families <- res_both__family %>%
+  slice_head(n = 10)
+
+# barplot of top 10 families
+bar_top10_fam <- ggplot(
+  top10_families,
+  aes(x = reorder(Family, mean_baseMean_both),
+      y = mean_baseMean_both)
+) +
+  geom_col(fill = "#4A7C7E") +
+  geom_text(aes(y = mean_baseMean_both * 1.03, label = sig_label),
+            family = "DejaVu Sans", size = 4, hjust = 0) +
+  coord_flip() +
+  theme_bw(base_family = "DejaVu Sans") +
+  xlab("Family") +
+  ylab("Mean abundance (PIG & PIG FARMER vs CTRL)") +
+  labs(title = "Top 10 most enriched families") +
+  scale_y_continuous(expand = expansion(mult = c(0.02, 0.12))) +
+  theme(
+    axis.text  = element_text(size = 11),
+    axis.title = element_text(size = 12)
+  )
+
+print(bar_top10_fam)
+
+
+```
+
+### family level
+```{r}
+# combine p-values for a family across both contrasts
+combine_p_fisher <- function(pvals) {
+  pvals <- pvals[is.finite(pvals) & !is.na(pvals)]
+  pvals <- pmax(pvals, 1e-300)
+  if (length(pvals) == 0) return(NA_real_)
+  stat <- -2 * sum(log(pvals))
+  pchisq(stat, df = 2 * length(pvals), lower.tail = FALSE)
+}
+
+res_both_family_input <- res_both %>%
+  left_join(meta_annot %>% select(SGB, Family), by = "SGB")
+
+res_both__family <- res_both_family_input %>%
+  filter(log2FC_PIG_CTRL > 1,
+         log2FC_PIGFARMER_CTRL > 1,
+         !is.na(Family.x)) %>%
+  group_by(Family.x) %>%
+  summarise(
+    mean_baseMean_PIG_CTRL       = mean(baseMean_PIG_CTRL, na.rm = TRUE),
+    mean_baseMean_PIGFARMER_CTRL = mean(baseMean_PIGFARMER_CTRL, na.rm = TRUE),
+    p_family = combine_p_fisher(c(padj_PIG_CTRL, padj_PIGFARMER_CTRL)),
+    n_sgb = n(),
+    n_sig_both = sum(padj_PIG_CTRL < 0.05 & padj_PIGFARMER_CTRL < 0.05, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    mean_baseMean_both = (mean_baseMean_PIG_CTRL + mean_baseMean_PIGFARMER_CTRL) / 2,
+    q_family = p.adjust(p_family, method = "BH"),
+    sig_label = case_when(
+      q_family < 0.001 ~ "***",
+      q_family < 0.01  ~ "**",
+      q_family < 0.05  ~ "*",
+      q_family < 0.10  ~ ".",
+      TRUE ~ "ns"
+    )
+  ) %>%
+  arrange(desc(mean_baseMean_both))
+
+
+top10_family <- res_both__family %>%
+  slice_head(n = 30)
+
+print(top10_family)
+
+str(top10_family)
+
+
+# barplot phylum level
+bar_top10_family <- ggplot(
+  top10_family,
+  aes(x = reorder(Family.x, mean_baseMean_both),
+      y = mean_baseMean_both)
+) +
+  geom_col(fill = "#4A7C7E") +
+  geom_text(aes(y = mean_baseMean_both * 1.03, label = sig_label),
+            family = "DejaVu Sans", size = 4) +
+  coord_flip() +
+  theme_bw(base_family = "DejaVu Sans") +
+  xlab("top 30 Family") +
+  ylab("Mean Abundance (PIG & PIG FARMER vs CTRL)") +
+  labs(
+    # title = "Top 30 familiae",
+    #subtitle = "Significance stars from family-level BH-adjusted Fisher combined p-values"
+  ) +
+  scale_y_continuous(expand = expansion(mult = c(0.02, 0.12))) +
+  theme(
+    axis.text  = element_text(size = 11),
+    axis.title = element_text(size = 12)
+  )+
+  theme_publication()+
+  theme(
+    axis.text.x = element_text(size = 10),
+    axis.text.y = element_text(size = 12)
+  )
+
+
+print(bar_top10_family)
+
+# save barplot
+ggsave("../figures/barplot_top10_family.svg",
+       plot = bar_top10_family,
+       width = 8,
+       height = 7.5,
+       dpi = 300)
+```
+

@@ -1,0 +1,448 @@
+# NMDS - realtive abundance data {#sec-NMDS-rel-abundance-data}
+
+## Dependencies
+
+`utils.R` **-script**
+
+```{r}
+#setwd("/Users/simeonstreit/Library/CloudStorage/OneDrive-UniversitaetBern/20_Pig_Project/Simeon")
+source("code/utils.R")
+
+# Load color codes from YAML file
+color_codes <- yaml::read_yaml("../Metadata/color_codes.yaml")
+
+# Extract specific color palettes
+sample_type_colors <- unlist(color_codes$sample_types)
+pig_stage_colors <- unlist(color_codes$pig_stages)
+category2_colors <- unlist(color_codes$category2)
+```
+
+**Packages**
+
+```{r}
+#| echo: true
+#| message: false
+#| warning: false
+#| results: hide
+
+
+# devtools::install_github("gmteunisse/fantaxtic")
+# devtools::install_github("gmteunisse/ggnested")
+library(tidyverse)
+library(BiocManager)
+library(phyloseq)
+library(ggnested)
+library(vegan)
+library(matrixStats) # for 'colAnys'-function in'filter_species_by_group_prevalence'-function.
+library(microViz)
+library(fantaxtic) # for making barplots
+library(gplots) # for enhanced heatmaps
+
+NPERMUTATIONS <- 999
+```
+
+## Data: Loading and Filtering (relative-Abundance data)
+
+```{r}
+# load metaphlan percentage file (relative abundance file)
+metaphlanData_percent <- read.table("data/raw/MF_SGB_percent.txt", header = TRUE, sep = "", row.names = 1)
+# convert rownames into first column
+metaphlanData_percent <- rownames_to_column(metaphlanData_percent, var = "clade_name")
+metaphlanData_percent$clade_name <- as.character(metaphlanData_percent$clade_name)
+
+# load metadata file
+metaData <- read.table("../metadata/metadata_silas.csv", header = TRUE, sep = ",") %>%
+    column_to_rownames(var = "id")
+
+
+metaData <- metaData[!grepl("ppB", rownames(metaData)), ]
+
+```
+
+check metaphlan percentage file
+
+```{r}
+metaphlanData_percent_check <- metaphlanData_percent %>%
+    select(-clade_name)
+
+summary(colSums(metaphlanData_percent_check))
+```
+
+filter metaphlan data (all ppB) samples
+
+```{r}
+# metaphlanData percentage
+
+
+```
+
+## Phyloseq-Object
+
+```{r}
+meta_physeq_percent <- metaphlan_to_phyloseq(metaphlanData_percent, metaData, version = 4, verbose = TRUE, tax_lvl = "SGB")
+ps_percent <- meta_physeq_percent
+ps_percent <- subset_taxa(ps_percent, Kingdom != "k__Eukaryota") # remove eukaryotes
+
+
+# check the ps-percent - object
+ps_kingdom <- tax_glom(ps_percent, taxrank = "Kingdom")
+otu_mat <- as(otu_table(ps_kingdom), "matrix")
+# print(otu_mat)
+
+
+# look if we have species without t__
+tax_names <- taxa_names(ps_percent)
+not_t_taxa <- tax_names[!grepl("t__", tax_names)]
+print(not_t_taxa)
+
+
+ps_taxa <- ps_percent
+
+```
+
+
+# Load AR genes
+
+```{r}
+# Load AR gene abundance data
+
+
+ph_arg = readRDS("../Genecatalog/results/physeq_normalized.rds")
+
+# filter AR gene abundance data to include only samples present in the metadata
+
+ph_arg <- prune_samples(rownames(metaData), ph_arg)
+
+# add fake taxonomy
+
+tax_table(ph_arg) <- matrix(paste0("ARG_", seq_len(ntaxa(ph_arg))), ncol = 1, dimnames = list(taxa_names(ph_arg), "Variant"))
+
+```
+
+### Filter Phyloseq-Object based on minimal relative abundance
+
+retain taxa whose average relative abundance across all samples exceeds $10^{-5}$.
+
+```{r}
+
+# percentage data
+# 10^-5 = 0.001% relative abundance
+ps_taxa_filt <- filter_taxa(
+    ps_taxa,
+    function(x) mean(x) > 1e-5,
+    prune = TRUE
+)
+
+# counts per million
+# 10 CPM = 0.001% relative abundance
+ps_arg_filt <- filter_taxa(
+    ph_arg,
+    function(x) mean(x) > 10,
+    prune = TRUE
+)
+
+
+print(ps_taxa_filt)
+
+print(ps_arg_filt)
+
+```
+
+
+## CLR transformation
+
+```{r}
+
+# CLR transformation for taxa data
+ps_taxa_clr <- tax_transform(ps_taxa_filt, trans = "clr",zero_replace="halfmin")
+
+# CLR transformation for AR gene abundance data
+ps_arg_clr <- tax_transform(ps_arg_filt, trans = "clr",zero_replace="halfmin",rank = "unique")
+
+```
+
+
+
+
+
+
+
+
+## Ordination analysis using microViz
+
+### PCA (CLR, SGB)
+```{r}
+ord_taxa <- ord_calc(ps_taxa_clr, method = "PCA")
+ord_arg <- ord_calc(ps_arg_clr, method = "PCA")
+
+
+
+```
+
+```{r}
+tax_ord_plot <- ord_plot(ord_taxa, color = "category2", size = 2) +
+  stat_ellipse(aes(color = category2)) +
+  #    ggtitle("PCA (CLR, SGB)") +
+  labs(color = "Category") +
+  scale_color_manual(
+    values = unlist(color_codes$category2),
+    labels = color_codes$label_mapping
+  )
+plot(tax_ord_plot)
+
+```
+
+
+```{r}
+arg_ord_plot <- ord_plot(ord_arg, color = "category2", size = 2) +
+  stat_ellipse(aes(color = category2)) +
+  #    ggtitle("PCA (CLR, AR)") +
+  labs(color = "Category") +
+  scale_color_manual(
+    values = unlist(color_codes$category2),
+    labels = color_codes$label_mapping
+  )
+plot(arg_ord_plot)
+
+
+
+```
+
+
+
+# Procrustes analysis
+
+```{r}
+Procrustes_Results = list()
+
+
+run_procrustes <- function(ps_taxa_clr, ps_arg_clr, sample_index) {
+
+    samples_in_both_datasets <- intersect(sample_names(ps_taxa_clr), sample_names(ps_arg_clr))
+
+    sample_index_internal <- intersect(samples_in_both_datasets, sample_index)
+
+    if (length(sample_index_internal) != length(sample_index)) {
+        dropped_samples <- setdiff(sample_index, samples_in_both_datasets)
+
+
+        warning(paste("Dropped samples in Procrustes analysis:", paste(dropped_samples, collapse = ", ")))
+    }
+
+    ps_taxa_clr |> ps_reorder(sample_index_internal) -> ps_taxa_clr
+    ps_arg_clr |> ps_reorder(sample_index_internal) -> ps_arg_clr
+
+    taxa_dist <- ps_taxa_clr |> otu_table() |> t() |> vegdist(method = "euclidean")
+    arg_dist <- ps_arg_clr |> otu_table() |> t() |> vegdist(method = "euclidean")
+
+    results <- vegan::protest(taxa_dist, arg_dist, permutations = NPERMUTATIONS)
+
+    return(list(
+        p_value = results$signif,
+        correlation = results$t0
+    ))
+}
+
+```
+
+
+```{r}
+
+setdiff(sample_names(ps_arg_clr), sample_names(ps_taxa_clr))
+
+setdiff(sample_names(ps_taxa_clr), sample_names(ps_arg_clr)) #s24H1 missing in arg
+
+```
+
+## all samples taxa vs AR genes
+
+```{r}
+
+sample_index <- intersect(sample_names(ps_taxa_clr), sample_names(ps_arg_clr))
+
+
+
+Procrustes_Results[["all_samples"]] <- run_procrustes(ps_taxa_clr, ps_arg_clr, sample_index)
+```
+
+
+## all samples, excluding Non_farmer_controls
+
+```{r}
+sample_index <- setdiff(intersect(sample_names(ps_taxa_clr), sample_names(ps_arg_clr)), rownames(metaData)[metaData$category2 == "Non_farmer_controls"])
+
+Procrustes_Results[["excluding_non_farmer_controls"]] <- run_procrustes(ps_taxa_clr, ps_arg_clr, sample_index)
+
+
+```
+
+
+## subgroups
+
+```{r}
+
+# Run species/stage specific Procrustes analyses
+
+for (species in unique(metaData$species)) {
+    for (stage in c( "Fattening", "Suckling",  "Weaning")) {
+        sample_index <- rownames(metaData)[metaData$species == species & metaData$growth_stage == stage]
+
+        name= paste0(species, "_", stage)
+
+        if (length(sample_index) > 1) {
+
+            
+            print(paste("Running Procrustes for:", name))
+
+            Procrustes_Results[[name]] <- run_procrustes(ps_taxa_clr, ps_arg_clr, sample_index)
+        } else {
+            print(paste("Skipping Procrustes for:", name, "- not enough samples"))
+        }
+    }
+}
+
+```
+
+
+
+## Procrustes results to dataframe
+
+```{r}
+procrustes_df <- do.call(rbind, lapply(names(Procrustes_Results), function(name) {
+    data.frame(
+        Group = name,
+        P_value = Procrustes_Results[[name]]$p_value,
+        Correlation = Procrustes_Results[[name]]$correlation
+    )
+}))
+print(procrustes_df)
+
+
+```
+
+
+# Correlation between ARG and taxa
+
+
+```{r}
+
+
+# Get the CLR-transformed abundance matrices
+common_samples <- setdiff(intersect(sample_names(ps_taxa_clr), sample_names(ps_arg_clr)), rownames(metaData)[metaData$category2 == "Non_farmer_controls"])
+
+taxa_matrix <- ps_taxa_clr |> ps_reorder(common_samples) |> otu_table() |> t()
+arg_matrix <- ps_arg_clr |> ps_reorder(common_samples) |> otu_table() |> t()
+
+# Calculate pearson correlation, p value and adjust p values for multiple testing
+# Pre-compute all pairwise Pearson correlations at once
+cor_matrix <- cor(taxa_matrix, arg_matrix, method = "pearson")
+
+# Compute p-values using vectorized correlation test
+# Uses the t-statistic: t = r * sqrt((n-2)/(1-r^2))
+n <- nrow(taxa_matrix)
+t_stat <- cor_matrix * sqrt((n - 2) / (1 - cor_matrix^2))
+p_matrix <- 2 * pt(abs(t_stat), df = n - 2, lower.tail = FALSE)
+
+# Reshape both matrices to long format in one step
+cor_results <- data.frame(
+    Taxa             = rep(colnames(taxa_matrix), times = ncol(arg_matrix)),
+    ARG              = rep(colnames(arg_matrix),  each  = ncol(taxa_matrix)),
+    Correlation      = as.vector(cor_matrix),
+    P_value          = as.vector(p_matrix),
+    Adjusted_P_value = NA_real_
+)
+
+# Adjust p-values for multiple testing using Benjamini-Hochberg method
+cor_results$Adjusted_P_value <- p.adjust(cor_results$P_value, method = "BH")
+
+cor_results[cor_results$Adjusted_P_value < 0.1 & abs(cor_results$Correlation) > 0.5, ]
+
+
+
+```
+
+
+
+
+
+## Prcurstes, human vs pig,  species per farm
+
+```{r}
+
+
+
+Procrustes_Results2 = list()
+
+
+for (stage in c( "Fattening", "Suckling",  "Weaning")) {
+
+
+pig_samples <- rownames(metaData)[metaData$species == "Pig" & metaData$growth_stage == stage]
+
+if (stage== "Weaning") {
+    human_samples <- rownames(metaData)[metaData$species == "Human" & metaData$growth_stage == "Suckling"]
+}else{
+human_samples <- rownames(metaData)[metaData$species == "Human" & metaData$growth_stage == stage]
+}
+
+
+ps_taxa_clr  |>  ps_reorder(human_samples) |> otu_table() |> t() -> human_matrix
+ps_taxa_clr  |> ps_reorder(pig_samples) |> otu_table() |> t() -> pig_matrix
+
+
+# name by farm
+rownames(human_matrix) <- metaData[human_samples, "farm"]
+rownames(pig_matrix) <- metaData[pig_samples, "farm"]
+
+farm_samples_intersect <- intersect(rownames(human_matrix), rownames(pig_matrix))
+
+
+results <- vegan::protest(vegdist(human_matrix[farm_samples_intersect,], method = "euclidean"), vegdist(pig_matrix[farm_samples_intersect,], method = "euclidean"), permutations = NPERMUTATIONS)
+
+
+Procrustes_Results2[[stage]] <- list(
+    p_value = results$signif,
+    correlation = results$t0
+)
+
+}
+
+Procrustes_Results2
+```
+
+
+# pigs stage 1 per stage2
+
+
+```{r}
+
+
+for (stage1 in c( "Fattening", "Suckling",  "Weaning")) {
+    for (stage2 in c( "Fattening", "Suckling",  "Weaning")) {
+        pig_samples_stage1 <- rownames(metaData)[metaData$species == "Pig" & metaData$growth_stage == stage1]
+        pig_samples_stage2 <- rownames(metaData)[metaData$species == "Pig" & metaData$growth_stage == stage2]
+
+        pig_matrix_stage1 <- ps_taxa_clr |> ps_reorder(pig_samples_stage1) |> otu_table() |> t()
+        pig_matrix_stage2 <- ps_taxa_clr |> ps_reorder(pig_samples_stage2) |> otu_table() |> t()
+
+
+        # Rename rows to farm
+        rownames(pig_matrix_stage1) <- metaData[pig_samples_stage1, "farm"]
+        rownames(pig_matrix_stage2) <- metaData[pig_samples_stage2, "farm"]
+
+
+        samples_intersect <- intersect(rownames(pig_matrix_stage1), rownames(pig_matrix_stage2))
+
+        
+        results <- vegan::protest(vegdist(pig_matrix_stage1[samples_intersect,], method = "euclidean"), vegdist(pig_matrix_stage2[samples_intersect,], method = "euclidean"), permutations = NPERMUTATIONS)
+
+        Procrustes_Results2[[paste0("Pig_",stage1, "_vs_", stage2)]] <- list(
+            p_value = results$signif,
+            correlation = results$t0
+        )
+
+    }
+}
+
+
+```

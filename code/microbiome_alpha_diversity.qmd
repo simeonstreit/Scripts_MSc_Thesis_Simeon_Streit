@@ -1,0 +1,979 @@
+---
+title: "Alypha Diversity Analysis"
+---
+
+# $𝛼$ diversity {#sec-alpha-diversity}
+
+$𝛼$ diversity is calculated on the raw reads
+
+## Dependencies
+
+`utils.R` **-script**
+
+```{r}
+source("utils.R")
+```
+
+**Packages**
+
+```{r}
+#| echo: true
+#| message: false
+#| warning: false
+#| results: hide
+
+
+#devtools::install_github("gmteunisse/fantaxtic")
+#devtools::install_github("gmteunisse/ggnested")
+library(tidyverse)
+library(BiocManager)
+library(phyloseq)
+library(ggnested)
+library(vegan)
+
+# for font
+library(ggplot2)
+library(ggpubr)
+library(patchwork)
+library(showtext)
+library(systemfonts)
+library(rstatix)
+
+font_add("DejaVu Sans", regular = systemfonts::font_info("DejaVu Sans")$path[1])
+showtext_auto()
+
+font_families()
+
+
+# load theme
+theme_publication <- function(base_size = 14, base_family = "DejaVu Sans") {
+ggplot2::theme_bw(
+base_size = base_size,
+base_family = base_family
+) +
+ggplot2::theme(
+plot.title = ggplot2::element_text(hjust = 0.5),
+axis.title = ggplot2::element_text(size = ggplot2::rel(1.05)),
+axis.text = ggplot2::element_text(size = ggplot2::rel(1.2)),
+legend.title = ggplot2::element_text(size = ggplot2::rel(0.95)),
+legend.text = ggplot2::element_text(size = ggplot2::rel(0.9)),
+strip.text = ggplot2::element_text(size = ggplot2::rel(0.95))
+)
+}
+
+```
+
+**Color Palette**
+
+```{r - load color palette }
+# Load color codes from YAML file
+color_codes <- yaml::read_yaml("../../Metadata/color_codes.yaml")
+
+# Extract specific color palettes
+sample_type_colors <- unlist(color_codes$sample_types)
+pig_stage_colors <- unlist(color_codes$pig_stages)
+category2_colors <- unlist(color_codes$category2)
+```
+
+## Data: Loading and Filtering
+
+-   MetaPhlAn-Output estimated count data table (MF_SGB_abundance.txt)
+-   MetaPhlAn-Output estimated read count based on all taxonomic levels (MF_abundance.txt)
+-   metaData
+
+```{r - load data}
+# metaphlan raw read data (MF_SGB_abundance.txt)
+metaphlanData <- read.table("../data/raw/MF_SGB_abundance.txt", header = TRUE, sep = "")
+metaphlanData$clade_name <- as.character(metaphlanData$clade_name)
+
+# load metadata
+metaData <- read.table("../../metadata/metadata_silas.csv", header = TRUE, sep = ",") %>%
+  column_to_rownames(var = "id")
+
+# assigns 0 to all NA's in my metaphlan data table
+metaphlanData[is.na(metaphlanData)] <- 0
+
+# load the MF_abundance.txt file for getting access to `UNCLASSIFIED`reads and filter those reads
+MF_abundance <- read.table("../data/raw/MF_abundance.txt", header = T, sep = "") %>%
+  filter(grepl("UNCLASSIFIED", clade_name))
+
+# adjust the colnames of MF_abundance to match with metaphlanData
+colnames(MF_abundance) <- gsub("^X", "C", colnames(MF_abundance))
+
+
+# marge MF_abudnance with metaphlanData
+metaphlanData_all <- rbind(metaphlanData, MF_abundance)
+
+```
+
+-   find species which are assigned to UNKOWN
+
+    ```{r - find `UKNOWN` assignemnt}
+    # Assuming your MetaPhlAn table is in a data frame called mpa
+    # Count the number of taxonomic levels per clade
+    mpa <- metaphlanData
+    # Assuming your MetaPhlAn table is in a data frame called mpa
+    # Count the number of taxonomic levels per clade
+    mpa$tax_level_count <- sapply(strsplit(mpa$clade_name, "\\|", fixed = FALSE), length)
+
+    # View rows with fewer than 8 levels (less than full taxonomy path)
+    mpa_incomplete <- mpa[mpa$tax_level_count < 8, ]
+
+    # Show unique clade names that are incomplete
+    unique(mpa_incomplete$clade_name)
+
+    ```
+
+-   filtering of all duplicated samples (ppB)
+
+```{r - filter metaphlan Data }
+# metaphlanData
+metaphlanData <- metaphlanData[, !grepl("ppB", colnames(metaphlanData))]
+
+
+```
+
+## Sample Numbers per Group
+
+```{r - sample numbers metadata barplots}
+# sample count per category
+meta_counts_category <- metaData %>%
+  rownames_to_column(var = "sample") %>%
+  dplyr::count(category, name = "n") %>%
+  mutate(
+    category = factor(category,
+                      levels = c("Non_farmer_controls", "Pig_farmers", "Pigs"))
+  )
+
+# define growth-stage legend for all categories
+meta_counts_stage <- metaData %>%
+  rownames_to_column(var = "sample") %>%
+  mutate(
+    growth_stage_plot = case_when(
+      category == "Non_farmer_controls" ~ "Control",
+      is.na(growth_stage) ~ "Unknown",
+      TRUE ~ as.character(growth_stage)
+    )
+  ) %>%
+  dplyr::count(category, growth_stage_plot, name = "n") %>%
+  mutate(
+    category = factor(category,
+                      levels = c("Non_farmer_controls", "Pig_farmers", "Pigs"))
+  )
+
+growth_stage_colors_plot <- c(
+  "Control" = sample_type_colors[["Non_farmer_controls"]],
+  pig_stage_colors
+)
+
+if ("Unknown" %in% meta_counts_stage$growth_stage_plot) {
+  growth_stage_colors_plot <- c(growth_stage_colors_plot, "Unknown" = "grey70")
+}
+
+# Plot A: total samples per category
+p_counts_category <- ggplot(meta_counts_category,
+                            aes(x = category, y = n, fill = category)) +
+  geom_col(width = 0.6, color = "black") +
+  geom_text(aes(label = n), vjust = 1.4, size = 5, family = "DejaVu Sans") +
+  scale_fill_manual(values = sample_type_colors) +
+  scale_x_discrete(labels = color_codes$label_mapping) +
+  labs(
+    # title = "Number of Samples per Category",
+    x = "",
+    y = "Sample count"
+  ) +
+  theme_publication() +
+  theme(legend.position = "none")
+
+# Plot B: category split by growth stage (controls shown as Control)
+p_counts_stage <- ggplot(meta_counts_stage,
+                         aes(x = category, y = n, fill = growth_stage_plot)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7, color = "black") +
+  geom_text(
+    aes(label = n),
+    position = position_dodge(width = 0.8),
+    vjust = 1.4,
+    size = 4.5,
+    family = "DejaVu Sans"
+  ) +
+  scale_fill_manual(values = growth_stage_colors_plot) +
+  scale_x_discrete(labels = color_codes$label_mapping) +
+  labs(
+    #title = "Sample Counts by Category and Growth Stage",
+    x = "",
+    y = "Sample count",
+    fill = "Grwoth Stage"
+  ) +
+  theme_publication()
+
+print(p_counts_category)
+print(p_counts_stage)
+
+# save plots
+ggsave("../figures/sample_counts_per_category.svg", plot = p_counts_category, width = 6, height = 7)
+ggsave("../figures/sample_counts_category_growth_stage.svg", plot = p_counts_stage, width = 7, height = 6.5)
+```
+
+## Phyloseq-Object
+
+```{r - create phyloseq-object}
+meta_physeq <- metaphlan_to_phyloseq(metaphlanData, metaData, version = 4, verbose = TRUE, tax_lvl = "SGB")
+
+ps <- meta_physeq
+ps <- subset_taxa(ps, Kingdom !="k__Eukaryota") # remove eukaryotes
+
+#View(ps@tax_table@.Data)
+
+ps@tax_table@.Data <- substring(ps@tax_table@.Data, 4)
+taxa_names(ps) <- substring(taxa_names(ps), 4)
+colnames(ps@tax_table@.Data)<- c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species", "SGB")
+```
+
+## Richness
+
+```{r - richness plots}
+# calculate sample counts
+sample_counts <- data.frame(ps@sam_data) %>%
+  group_by(category) %>%
+  summarise(n = n(), .groups = 'drop')
+
+
+# plot richness with amount of samples
+plot_richness(ps, x = "category", color = "category",
+              scales = "free_y")+
+  scale_color_manual(values = sample_type_colors)+
+  geom_violin()+
+  geom_jitter(alpha = 0.5)+
+  geom_text(data = sample_counts,
+            aes(x = category, y = 0, label = paste0("n=",n)),
+                vjust = 2, size = 3, color ="black")+
+  theme_publication()+
+  ggtitle("Species Richness per Category")+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+### save the plot
+
+```{r - save richness plot }
+
+# save richness plot 
+ggsave("../figures/richness_per_category.svg", width = 15, height = 6)
+```
+
+## 𝛼-diversity
+
+### dataframe with all relevant data
+
+we create a dataframe which includes 𝛼 diversity metrix (Shannon) and different other parameters we need:
+
+-   total read count of all classified reads
+
+-   total read count of all unclassified reads
+
+-   sum of classified + unclassified
+
+-   merged with metadata to make the plot
+
+```{r - alpha diversity dataframe}
+library(dplyr)
+library(tibble)
+
+# total `CLASSIFIED` read count per sample
+classified <- data.frame(t(ps@otu_table)) %>%
+  mutate(classified_reads = rowSums(.)) %>%
+  select(classified_reads)
+
+# extract Eukaryotic samples in my metaphlan Data
+eukaryotic <- metaphlanData_all %>%
+  filter(grepl("k__Eukaryota", clade_name)) %>%
+  select(-c("clade_name", "clade_taxid")) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "sample",
+    values_to = "eukaryotic_reads"
+  ) %>% 
+  group_by(sample) %>%
+  summarise(eukaryotic_reads = sum(eukaryotic_reads), .groups = "drop") %>%
+  column_to_rownames(var = "sample")
+
+
+# total `UNCLASSIFIED`
+unclassified <- metaphlanData_all%>%
+  filter(clade_name == "UNCLASSIFIED") %>%
+  select(-c("clade_name", "clade_taxid")) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "sample",
+    values_to = "unclassified_reads"
+  ) %>% 
+  left_join(eukaryotic %>% rownames_to_column(var = "sample"), by = "sample") %>% # add eukaryotic reads
+  mutate(
+    unclassified_reads = unclassified_reads + eukaryotic_reads) %>% # add eukaryotic reads to unclassified reads
+  column_to_rownames(var = "sample")
+
+
+# calculate alpha diversity
+df_ps <- as.data.frame(otu_table(ps))
+df_ps <- t(df_ps)
+
+shannon <- diversity(df_ps, index = "shannon") # diversity function from vegan package to calculate shannon diversity 
+simpson <- diversity(df_ps, index = "simpson")
+
+# make data.frame 
+alpha_diversity <- data.frame(
+  sample = rownames(df_ps),
+  shannon = shannon,
+  simpson = simpson) %>%
+  left_join(classified %>% rownames_to_column(var = "sample"), by = "sample") %>%
+  left_join(metaData %>% rownames_to_column(var = "sample"), by = "sample") %>%
+  left_join(unclassified %>% rownames_to_column(var = "sample"), by = "sample") %>%
+  mutate(
+    total_reads = classified_reads + unclassified_reads
+  ) %>%
+  mutate(
+    classified_total_ratio = classified_reads / total_reads
+  )
+```
+
+### Classified vs. Unclassified reads
+
+this plot should quickly show how much unclassified reads we have per category (Pig, Pigfarmer, Controls).
+
+The unclassified reads we find in MF_abudnance.txt as they are not present in SGB_abundance.txt.
+
+#### barplot - classified vs unclassified reads
+
+```{r - barplot unclassified vs. classified reads}
+
+barplot_classified_unclassified <- alpha_diversity %>%
+  group_by(category)%>%
+  summarise(
+    mean_classified = mean(classified_reads),
+    mean_unclassified = mean(unclassified_reads), 
+    .groups = "drop") %>%
+  pivot_longer(cols = starts_with("mean_"),
+               names_to = "type", 
+               values_to = "mean_reads"
+  )
+
+library(viridis)
+# bar plot
+barplot <- ggplot(barplot_classified_unclassified, 
+                  aes(fill = type, y = mean_reads, x = category))+
+  geom_bar(stat = "identity", position = "stack", width = 0.5, color ="black")+
+  theme_publication()+
+  scale_x_discrete(labels = color_codes$label_mapping)+
+  ylab("Mean Reads per Category")+
+  scale_fill_brewer(palette = "Dark2")+
+  theme(
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    axis.text.x = element_text(size = 11)
+  )
+  
+print(barplot)
+
+
+```
+
+**save this plot**
+
+```{r - save barplot classified vs unclassified}
+ggsave("../figures/barplot_classified_unclassified_reads.svg", plot = barplot,
+       width = 6, height = 6)
+```
+
+#### boxplot classified to total ratio boxplot
+
+```{r - boxplot classified to total ratio}
+# boxplot with suckling / older pigs separated 
+
+# set the order correctly in the plot
+alpha_diversity$category2 <- factor(alpha_diversity$category2,
+                                       levels = c("Suckling_piglets",
+                                                  "Older_pigs",
+                                                  "Pig_farmers",
+                                                  "Non_farmer_controls"))
+
+
+# set the order of catergory correctly
+alpha_diversity$category <- factor(alpha_diversity$category,
+                                   levels = c("Pigs",
+                                              "Pig_farmers",
+                                              "Non_farmer_controls"))
+
+# custom formatter: keep tiny p-values readable
+ratio_p_label <- function(p_value) {
+  ifelse(p_value < 0.001, "p < 0.001", paste0("p = ", sprintf("%.3f", p_value)))
+}
+
+
+ratio_pvals <- alpha_diversity %>%
+  pairwise_wilcox_test(classified_total_ratio ~ category, p.adjust.method = "BH") %>%
+  add_xy_position(x = "category") %>%
+  mutate(p_label = ratio_p_label(p.adj))
+
+
+
+boxplot_classified_ratio <- ggplot(alpha_diversity,
+                                   aes(x = category, y = classified_total_ratio, fill = category))+
+  geom_boxplot(outlier.shape = NA, alpha = 0.5)+
+  geom_jitter(alpha = 0.3, width = 0.2)+
+  scale_fill_manual(values = sample_type_colors, drop = F)+
+  stat_pvalue_manual(
+    ratio_pvals,
+    label = "p_label",
+    hide.ns = TRUE,
+    tip.length = 0.01,
+    size = 4,
+    family = "DejaVu Sans"
+  )+
+  #ggtitle("Classified to Total Reads Ratio per Category")+
+  xlab("")+
+  ylab("Classified / Total estimated reads")+
+  scale_x_discrete(labels = color_codes$label_mapping)+
+  theme(legend.position = "none")+
+  theme_publication()+
+  theme(legend.position = "none")
+
+
+print(boxplot_classified_ratio)
+                      
+```
+
+**save this plot**
+
+```{r - save boxplot}
+ggsave("../figures/boxplot_classified_total_reads_ratio.svg", plot = boxplot_classified_ratio,
+       width = 6, height = 7)
+```
+
+### 𝛼- Diversity violin plots (not for paper)
+
+$alpha$ diversity violin plots
+
+-   A: pigs / pig workers / ctrls
+
+-   B: pigs per stage
+
+-   C: per farm (only pig data)
+
+```{r - alpha diversity plot without read depth accounting}
+# plot A: pig / pig workers / ctrls
+plot_alpha_A <- ggplot(
+  data = alpha_diversity, 
+  aes(x = category, y = shannon, fill = category))+
+    geom_violin(trim = FALSE, alpha = 0.5, position = "dodge")+
+    geom_boxplot(width = 0.1, outlier.shape = NA, fill = "grey", notch= TRUE)+
+  scale_fill_manual(values = sample_type_colors)+
+  geom_jitter(alpha = 0.3, width = 0.2)+
+  theme_publication()+
+  ggtitle("Alpha Diversity of Pigs, Pig Worker and Controls")
+
+plot(plot_alpha_A)
+
+# plot B: pigs per stage
+
+plot_alpha_B <- alpha_diversity %>%
+  filter(species == "Pig") %>%
+  mutate(growth_stage = factor(growth_stage,
+                               levels = c("Suckling", "Weaning", "Fattening"))) %>%
+  ggplot(aes(x = growth_stage, y = shannon, fill = growth_stage)) +
+    geom_violin(trim = FALSE, alpha = 0.6, position = "dodge") +
+    geom_boxplot(width = 0.1, outlier.shape = NA, fill = "grey", notch = TRUE) +
+    scale_fill_manual(values = pig_stage_colors) +
+    theme_publication() +
+    geom_jitter(alpha = 0.3, width = 0.2) +
+    labs(x = "", y = "Shannon diversity index (H)",
+         title = "Alpha Diversity of Suckling, Weaning and Fattening pigs")
+
+plot(plot_alpha_B)
+
+# plot C: farms (only pig data)
+plot_alpha_C <- alpha_diversity %>%
+  filter(species == "pig") %>%
+  ggplot(
+    aes(x = farm_number, y = shannon, shape = stage))+
+  geom_point()
+
+plot(plot_alpha_C)
+```
+
+**save the plots**
+
+```{r - save alpha diversity plots wiihtout read depth accounting}
+ggsave("../figures/alpha_diversity_A_species.svg", plot = plot_alpha_A, width = 8, height = 6)
+ggsave("../figures/alpha_diversity_B_stages_pigs.svg", plot = plot_alpha_B, width = 8, height = 6)
+```
+
+### 𝛼 diversity with accounting for read depth
+
+#### linear model plot - by species
+
+With a linear model, we are statistically evaluating whether different groups (defined by your "category" variable) have significant differences in Shannon diversity, while at the same time adjusting for the confounding effect of sequencing depth (total_reads).
+
+the model fits Shannon diversity as a function of our sample categories and the total number of reads for each sample (sequencing depth). By including total_reads as a covariate, we control for the fact that samples with more reads might artificially appear to have higher diversity due to deeper sequencing. Therefore, true groups effects can be isolated from technical variability.
+
+With the `emmenans` package we compute pairwise differences between all the group levels for the category variable and we adjust the p-value with Tukey test to correct for multiple comparisons.
+
+```{r - alpha LM model species }
+lm_model<- lm(shannon ~ category + total_reads, data = alpha_diversity)
+
+
+plot(lm_model)
+
+# pairwise group comparison
+library(emmeans)
+pairwise_results <- emmeans(lm_model, pairwise ~ category, adjust = "tukey")
+
+
+# extract p values
+pvals <- summary(pairwise_results$contrasts)
+
+
+# p-value dataframe
+pval_df <- pvals %>%
+  mutate(
+    group1 = sub(" - .*", "", contrast),
+    group2 = sub(".* - ", "", contrast)  # add space before group2 if needed
+  ) %>%
+  select(group1, group2, p.value) %>%
+  mutate(
+    y.position = max(alpha_diversity$shannon, na.rm = TRUE) * 
+                   (1 + 0.1 * row_number())
+  )
+
+
+
+# violin plot
+library(ggplot2)
+library(ggpubr)
+library(scales) # for p-value formatting
+
+
+
+clean_p <- function(x) {
+  ifelse(
+    x < 0.001,
+    "<0.001",   
+    sprintf("%.3f", x)           # e.g. 0.155
+  )
+}
+
+pval_df$p_label <- clean_p(pval_df$p.value)
+
+# define the order of groups
+alpha_diversity$category <- factor(alpha_diversity$category,
+                                   levels = c("Non_farmer_controls",
+                                              "Pig_farmers",
+                                              "Pigs"))
+
+# plot violin plots including LM model
+alpha_diversity_lm_plot <- ggboxplot(
+    alpha_diversity,
+    x = "category",
+    y = "shannon",
+    fill = "category"
+  )+
+  geom_jitter(alpha = 0.3, width = 0.2)+
+  facet_wrap(~"Alpha Diversity per Group", nrow = 1)+
+  scale_fill_manual(values = sample_type_colors)+
+  theme_bw(base_family = "DejaVu Sans")+
+  stat_pvalue_manual(
+      pval_df,
+      label = "p_label",
+      xmin = "group1", xmax = "group2",
+      y.position = "y.position",
+      tip.length = 0.02,
+      family = "DejaVu Sans",
+      size = 6
+    ) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1)))+
+  ylab("Shannon Diversity Index")+
+  xlab("")+
+  scale_x_discrete(labels = color_codes$label_mapping)+
+  theme_publication()+
+  theme(
+    legend.position = "none",
+    # axis.text.x = element_text(size = 11),
+    # axis.text.y = element_text(size = 11),
+    #axis.title.y = element_text(size = 12),
+    strip.background = element_rect(fill = "grey85", color = "black"),
+    strip.text = element_text(
+      face ="bold", 
+      size = 14,
+      family = "DejaVu Sans"),
+    plot.margin = margin(5.5,5.5,5.5,5.5)
+    )
+  
+
+print(alpha_diversity_lm_plot)
+```
+
+**save this figure**
+
+```{r - save alpha LM model species}
+ggsave("../figures/alpha_diversity_species_LM.svg", plot =alpha_diversity_lm_plot, width = 8, height = 8 )
+```
+
+#### linear model - by pig grwoth stage
+
+```{r linear model by stage}
+library(scales) # for p-value formatting
+
+# filter alpha diversity for pigs only
+alpha_diversity_pigs <- alpha_diversity %>%
+  filter(species == "Pig")
+
+# make linear model
+lm_model_stage <- lm(shannon ~ growth_stage + total_reads, data = alpha_diversity_pigs)
+
+# pairwise group comparison
+library(emmeans)
+pairwise_results_stage <- emmeans(lm_model_stage, pairwise ~ growth_stage, adjust = "tukey")
+
+# extract p values
+pvals_stage <- summary(pairwise_results_stage$contrasts)
+
+
+# p-value dataframe
+pval_stage_df <- pvals_stage %>%
+  mutate(
+    group1 = sub(" - .*", "", contrast),
+    group2 = sub(".* - ", "", contrast)  # add space before group2 if needed
+  ) %>%
+  select(group1, group2, p.value) %>%
+  mutate(
+    y.position = max(alpha_diversity$shannon, na.rm = TRUE) * 
+                   (1 + 0.1 * row_number()),
+    p.label = clean_p(p.value)
+  )
+
+
+# adjust the factor for correct order
+alpha_diversity_pigs$growth_stage <- factor(alpha_diversity_pigs$growth_stage,
+                                            levels= c("Suckling",
+                                                      "Weaning",
+                                                      "Fattening"))
+
+# violin plot
+library(ggplot2)
+library(ggpubr)
+
+alpha_diversity_stage_lm_plot <- ggboxplot(
+    alpha_diversity_pigs,
+    x = "growth_stage",
+    y = "shannon",
+    add = "boxplot", 
+    fill = "growth_stage"
+  )+
+  geom_jitter(alpha = 0.3, width = 0.2)+
+  facet_wrap(~"Alpha Diversity per Pig Growth Stage", nrow = 1)+
+  scale_fill_manual(values = pig_stage_colors)+
+  theme_bw(base_family = "DejaVu Sans")+
+  stat_pvalue_manual(
+      pval_stage_df,
+      label = "p.label",
+      xmin = "group1", xmax = "group2",
+      y.position = "y.position",
+      tip.length = 0.02,
+      family = "DejaVu Sans",
+      size = 6
+    ) +
+  xlab("")+
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1)))+
+  xlab("Pig Growth Stage")+
+  theme_publication()+
+  theme(legend.position = "none",
+        strip.background = element_rect(fill = "grey85", color = "black"),
+        strip.text = element_text(size = 13,
+                                  family = "DejaVu Sans"),
+        # axis.text.x = element_text(size = 11),
+        # axis.text.y = element_text(size = 11),
+        # axis.title.y = element_text(size = 12),
+        axis.title.x = element_blank(),
+        plot.margin = margin(5.5,5.5,5.5,0))+
+  ylim(1,8)
+
+print(alpha_diversity_stage_lm_plot)
+
+```
+
+**save this plot**
+
+```{r - save this plot}
+ggsave("../figures/alpha_diversity_stage_LM.svg", plot = alpha_diversity_stage_lm_plot, height = 8, width = 8 )
+```
+
+### final alpha diversity plot
+```{r}
+
+# right blot (stage)
+alpha_diversity_stage_lm_plot_r <- alpha_diversity_stage_lm_plot +
+  theme(
+    axis.title.y = element_blank(),
+    axis.text.y  = element_blank(),
+    axis.ticks.y = element_blank()
+  )
+
+alpha_diversity_stage_lm_plot_r
+
+library(patchwork)
+
+combined <- alpha_diversity_lm_plot + alpha_diversity_stage_lm_plot_r +
+  plot_layout(ncol = 2, guides = "collect") & theme(
+  axis.text.x = element_text(size = 17),
+  axis.text.y = element_text(size = 18))
+
+combined
+
+ggsave("../figures/alpha_diversity_combined_LM.svg", plot = combined,
+       height = 6, 
+       width = 8.5,
+       device = svglite::svglite)
+
+```
+
+### Simpson diversity with accounting for read depth
+
+```{r - simpson LM model species}
+# linear model for simpson by category
+lm_model_simpson <- lm(simpson ~ category + total_reads, data = alpha_diversity)
+
+pairwise_results_simpson <- emmeans(lm_model_simpson, pairwise ~ category, adjust = "tukey")
+pvals_simpson <- summary(pairwise_results_simpson$contrasts)
+
+pval_simpson_df <- pvals_simpson %>%
+  mutate(
+    group1 = sub(" - .*", "", contrast),
+    group2 = sub(".* - ", "", contrast)
+  ) %>%
+  select(group1, group2, p.value) %>%
+  mutate(
+    y.position = max(alpha_diversity$simpson, na.rm = TRUE) * (1 + 0.08 * row_number()),
+    p.label = clean_p(p.value)
+  )
+
+alpha_diversity$category <- factor(alpha_diversity$category,
+                                   levels = c("Non_farmer_controls", "Pig_farmers", "Pigs"))
+
+simpson_lm_plot <- ggboxplot(
+  alpha_diversity,
+  x = "category",
+  y = "simpson",
+  fill = "category"
+) +
+  geom_jitter(alpha = 0.3, width = 0.2) +
+  facet_wrap(~"Simpson Diversity per Group", nrow = 1) +
+  scale_fill_manual(values = sample_type_colors) +
+  theme_bw(base_family = "DejaVu Sans") +
+  stat_pvalue_manual(
+    pval_simpson_df,
+    label = "p.label",
+    xmin = "group1", xmax = "group2",
+    y.position = "y.position",
+    tip.length = 0.02,
+    family = "DejaVu Sans",
+    size = 6
+  ) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.12))) +
+  ylab("Simpson Diversity Index") +
+  xlab("") +
+  scale_x_discrete(labels = color_codes$label_mapping) +
+  theme_publication() +
+  theme(
+    legend.position = "none",
+    strip.background = element_rect(fill = "grey85", color = "black"),
+    strip.text = element_text(face = "bold", size = 14, family = "DejaVu Sans"),
+    plot.margin = margin(5.5, 5.5, 5.5, 5.5)
+  )
+
+print(simpson_lm_plot)
+ggsave("../figures/simpson_diversity_species_LM.svg", plot = simpson_lm_plot, width = 8, height = 8)
+```
+
+```{r - simpson LM model stage}
+# linear model for simpson by pig growth stage
+alpha_diversity_pigs_simpson <- alpha_diversity %>%
+  filter(species == "Pig") %>%
+  mutate(growth_stage = factor(growth_stage, levels = c("Suckling", "Weaning", "Fattening")))
+
+lm_model_stage_simpson <- lm(simpson ~ growth_stage + total_reads, data = alpha_diversity_pigs_simpson)
+pairwise_results_stage_simpson <- emmeans(lm_model_stage_simpson, pairwise ~ growth_stage, adjust = "tukey")
+pvals_stage_simpson <- summary(pairwise_results_stage_simpson$contrasts)
+
+pval_stage_simpson_df <- pvals_stage_simpson %>%
+  mutate(
+    group1 = sub(" - .*", "", contrast),
+    group2 = sub(".* - ", "", contrast)
+  ) %>%
+  select(group1, group2, p.value) %>%
+  mutate(
+    y.position = max(alpha_diversity_pigs_simpson$simpson, na.rm = TRUE) * (1 + 0.08 * row_number()),
+    p.label = clean_p(p.value)
+  )
+
+simpson_stage_lm_plot <- ggboxplot(
+  alpha_diversity_pigs_simpson,
+  x = "growth_stage",
+  y = "simpson",
+  add = "boxplot",
+  fill = "growth_stage"
+) +
+  geom_jitter(alpha = 0.3, width = 0.2) +
+  facet_wrap(~"Simpson Diversity per Pig Growth Stage", nrow = 1) +
+  scale_fill_manual(values = pig_stage_colors) +
+  theme_bw(base_family = "DejaVu Sans") +
+  stat_pvalue_manual(
+    pval_stage_simpson_df,
+    label = "p.label",
+    xmin = "group1", xmax = "group2",
+    y.position = "y.position",
+    tip.length = 0.02,
+    family = "DejaVu Sans",
+    size = 6
+  ) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.12))) +
+  xlab("") +
+  ylab("Simpson Diversity Index") +
+  theme_publication() +
+  theme(
+    legend.position = "none",
+    strip.background = element_rect(fill = "grey85", color = "black"),
+    strip.text = element_text(size = 13, family = "DejaVu Sans"),
+    axis.title.x = element_blank(),
+    plot.margin = margin(5.5, 5.5, 5.5, 0)
+  )
+
+print(simpson_stage_lm_plot)
+ggsave("../figures/simpson_diversity_stage_LM.svg", plot = simpson_stage_lm_plot, width = 8, height = 8)
+```
+
+```{r - final simpson diversity plot}
+simpson_stage_lm_plot_r <- simpson_stage_lm_plot +
+  theme(
+    axis.title.y = element_blank(),
+    axis.text.y  = element_blank(),
+    axis.ticks.y = element_blank()
+  )
+
+combined_simpson <- simpson_lm_plot + simpson_stage_lm_plot_r +
+  plot_layout(ncol = 2, guides = "collect") &
+  theme(
+    axis.text.x = element_text(size = 17),
+    axis.text.y = element_text(size = 18)
+  )
+
+combined_simpson
+
+ggsave("../figures/simpson_diversity_combined_LM.svg", plot = combined_simpson,
+       height = 6,
+       width = 8.5,
+       device = svglite::svglite)
+```
+
+
+## Rarefaction Plot
+
+```{r - rarefraction plots }
+library(phyloseq)
+
+set.seed(1234)
+
+ps.rarefied <- rarefy_even_depth(ps, rngseed = 1, sample.size = min(sample_sums(ps)),replace = F)
+```
+
+```{r}
+library(vegan)
+library(permute)
+
+set.seed(1)
+otu <- as(otu_table(ps), "matrix")
+otu.rf <- rrarefy(otu, min(sample_sums(ps)))
+
+# rarefaction curves
+rarecurve(otu, step = 10000, label = F)
+
+ps.rarefied <- ps
+otu_table(ps.rarefied) <- otu_table(otu.rf, taxa_are_rows = taxa_are_rows(ps))
+```
+
+
+## Pielou's eveness
+```{r}
+# Pielou's evenness J = H / ln(S)
+# H: Shannon diversity, S: number of observed taxa (richness)
+otu_even <- as(otu_table(ps), "matrix")
+if (taxa_are_rows(ps)) {
+  otu_even <- t(otu_even)
+}
+
+pielou_df <- data.frame(
+  sample = rownames(otu_even),
+  richness = rowSums(otu_even > 0),
+  stringsAsFactors = FALSE
+) %>%
+  mutate(
+    pielou_evenness = ifelse(richness > 1, shannon / log(richness), NA_real_)
+  )
+
+# add metadata and keep order used in other category plots
+pielou_df <- pielou_df %>%
+  left_join(alpha_diversity %>% select(sample, category), by = "sample") %>%
+  mutate(
+    category = factor(category,
+                      levels = c("Non_farmer_controls", "Pig_farmers", "Pigs"))
+  )
+
+pielou_comparisons <- list(
+  c("Non_farmer_controls", "Pig_farmers"),
+  c("Non_farmer_controls", "Pigs"),
+  c("Pig_farmers", "Pigs")
+)
+
+pielou_plot <- ggplot(pielou_df,
+                      aes(x = category, y = pielou_evenness, fill = category)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.7) +
+  geom_jitter(width = 0.2, alpha = 0.35, size = 2, color = "black") +
+  scale_fill_manual(values = sample_type_colors) +
+  scale_x_discrete(labels = color_codes$label_mapping) +
+  xlab("") +
+  ylab("Pielou's Evenness (J)") +
+  labs(title = "Pielou's Evenness per Category") +
+  stat_compare_means(
+    comparisons = pielou_comparisons,
+    method = "wilcox.test",
+    aes(label = after_stat(p.format)),
+    step.increase = 0.08,
+    size = 5,
+    family = "DejaVu Sans"
+  ) +
+  theme_publication() +
+  theme(legend.position = "none")
+
+print(pielou_plot)
+
+ggsave("../figures/pielou_evenness_per_category.svg",
+       plot = pielou_plot,
+       width = 7,
+       height = 6)
+
+```
+
+## Summary
+
+This analysis includes the alpha and beta diversity calculation for based on the phyloseq object created from MetaPhlAn output:
+
+-   Richness calculation
+-   calculation of alpha diversity dataframe including:
+    -   shannon diversity
+    -   classified reads
+    -   unclassified reads
+    -   total reads
+    -   classified to total reads ratio
+-   boxplot of classified vs unclassified reads per category
+-   alpha diversity (without accounting for the read depth)
+-   alpha diversity plots accouting for the rarefraction curve
+-   rarefraction curve
+
+

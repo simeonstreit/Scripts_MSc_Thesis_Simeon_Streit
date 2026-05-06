@@ -1,0 +1,164 @@
+---
+title: "Quality Control Plots"
+---
+
+# Quality Control
+
+This document creates additional QC plots and saves them in `../figures`.
+
+## Dependencies
+
+```{r}
+source("utils.R")
+```
+
+## Packages
+
+```{r}
+#| echo: true
+#| message: false
+#| warning: false
+
+library(tidyverse)
+library(phyloseq)
+library(ggpubr)
+library(showtext)
+library(systemfonts)
+
+font_add("DejaVu Sans", regular = systemfonts::font_info("DejaVu Sans")$path[1])
+showtext_auto()
+
+# same plotting theme style as your other analyses
+theme_publication <- function(base_size = 18, base_family = "DejaVu Sans") {
+  ggplot2::theme_bw(
+    base_size = base_size,
+    base_family = base_family
+  ) +
+    ggplot2::theme(
+      plot.title = ggplot2::element_text(hjust = 0.5),
+      axis.title = ggplot2::element_text(size = ggplot2::rel(1.05)),
+      axis.text = ggplot2::element_text(size = ggplot2::rel(1.2)),
+      legend.title = ggplot2::element_text(size = ggplot2::rel(0.95)),
+      legend.text = ggplot2::element_text(size = ggplot2::rel(0.9)),
+      strip.text = ggplot2::element_text(size = ggplot2::rel(0.95))
+    )
+}
+```
+
+## Colors
+
+```{r}
+#| message: false
+# try your common path first, then fallback
+color_codes <- NULL
+if (file.exists("../../Metadata/color_codes.yaml")) {
+  color_codes <- yaml::read_yaml("../../Metadata/color_codes.yaml")
+} else if (file.exists("../metadata/color_codes.yaml")) {
+  color_codes <- yaml::read_yaml("../metadata/color_codes.yaml")
+}
+
+if (!is.null(color_codes)) {
+  sample_type_colors <- unlist(color_codes$sample_types)
+} else {
+  sample_type_colors <- c(
+    "Pigs" = "#4A7C7E",
+    "Pig_farmers" = "#D4843D",
+    "Non_farmer_controls" = "#B04A7A"
+  )
+}
+```
+
+## Data Setup
+
+```{r}
+#| message: false
+#| warning: false
+
+# metaData
+if (!exists("metaData")) {
+  if (file.exists("../../metadata/metadata_silas.csv")) {
+    metaData <- read.table("../../metadata/metadata_silas.csv", header = TRUE, sep = ",") %>%
+      column_to_rownames(var = "id")
+  } else if (file.exists("../metadata/metadata_silas.csv")) {
+    metaData <- read.table("../metadata/metadata_silas.csv", header = TRUE, sep = ",") %>%
+      column_to_rownames(var = "id")
+  } else {
+    stop("metadata_silas.csv not found")
+  }
+}
+
+# metaphlanData_all
+if (!exists("metaphlanData_all")) {
+  metaphlanData <- read.table("../data/raw/MF_SGB_abundance.txt", header = TRUE, sep = "")
+  metaphlanData$clade_name <- as.character(metaphlanData$clade_name)
+  metaphlanData[is.na(metaphlanData)] <- 0
+
+  MF_abundance <- read.table("../data/raw/MF_abundance.txt", header = TRUE, sep = "") %>%
+    filter(grepl("UNCLASSIFIED", clade_name) | grepl("k__Eukaryota", clade_name))
+  colnames(MF_abundance) <- gsub("^X", "C", colnames(MF_abundance))
+
+  metaphlanData_all <- rbind(metaphlanData, MF_abundance)
+}
+
+# ps
+if (!exists("ps")) {
+  if (file.exists("../data/processed/ps_filtered.Rdata")) {
+    load("../data/processed/ps_filtered.Rdata")
+    if (exists("ps_filtered")) {
+      ps <- ps_filtered
+    }
+  }
+}
+
+if (!exists("ps")) {
+  stop("Object 'ps' not found. Please create ps first (e.g., in alpha diversity script) or provide ps_filtered.Rdata.")
+}
+
+# optional alpha_diversity
+if (!exists("alpha_diversity")) {
+  alpha_diversity <- NULL
+}
+```
+
+## Create QC Plots
+
+```{r}
+#| message: false
+# robust source path resolution
+qc_script <- NULL
+for (p in c("additional_qc_plots.R", "code/additional_qc_plots.R", "./code/additional_qc_plots.R")) {
+  if (file.exists(p)) {
+    qc_script <- p
+    break
+  }
+}
+
+if (is.null(qc_script)) {
+  stop("Could not find additional_qc_plots.R. Expected in code/ folder.")
+}
+
+source(qc_script)
+
+qc_out <- make_additional_qc_plots(
+  ps = ps,
+  metaphlanData_all = metaphlanData_all,
+  metaData = metaData,
+  alpha_diversity = alpha_diversity,
+  sample_type_colors = sample_type_colors,
+  color_codes = color_codes,
+  theme_publication = theme_publication,
+  out_dir = "../figures"
+)
+```
+
+## Preview
+
+```{r}
+if (!exists("qc_out")) {
+  stop("qc_out not found. Run the 'Create QC Plots' chunk first and check for earlier errors.")
+}
+
+print(qc_out$p_qc_comp)
+print(qc_out$p_qc_detect)
+if (!is.null(qc_out$p_qc_depth)) print(qc_out$p_qc_depth)
+```

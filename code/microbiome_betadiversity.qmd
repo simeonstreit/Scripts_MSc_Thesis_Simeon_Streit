@@ -1,0 +1,1359 @@
+# NMDS - realtive abundance data {#sec-NMDS-rel-abundance-data}
+
+## Dependencies
+
+`utils.R` **-script**
+
+```{r}
+setwd("/Users/simeonstreit/Library/CloudStorage/OneDrive-UniversitaetBern/20_Pig_Project/Simeon")
+source("datautils.R")
+
+# Load color codes from YAML file
+color_codes <- yaml::read_yaml("../../Metadata/color_codes.yaml")
+
+# Extract specific color palettes
+sample_type_colors <- unlist(color_codes$sample_types)
+pig_stage_colors <- unlist(color_codes$pig_stages)
+category2_colors <- unlist(color_codes$category2)
+
+
+# set theme
+# theme
+theme_publication <- function(base_size = 14, base_family = "DejaVu Sans") {
+ggplot2::theme_bw(
+base_size = base_size,
+base_family = base_family
+) +
+ggplot2::theme(
+plot.title = ggplot2::element_text(hjust = 0.5),
+axis.title = ggplot2::element_text(size = ggplot2::rel(1.05)),
+axis.text = ggplot2::element_text(size = ggplot2::rel(0.95)),
+legend.title = ggplot2::element_text(size = ggplot2::rel(0.95)),
+legend.text = ggplot2::element_text(size = ggplot2::rel(0.9)),
+strip.text = ggplot2::element_text(size = ggplot2::rel(0.95))
+)
+}
+```
+
+**Packages**
+
+```{r}
+#| echo: true
+#| message: false
+#| warning: false
+#| results: hide
+
+
+# devtools::install_github("gmteunisse/fantaxtic")
+# devtools::install_github("gmteunisse/ggnested")
+library(tidyverse)
+library(BiocManager)
+library(phyloseq)
+library(ggnested)
+library(vegan)
+library(matrixStats) # for 'colAnys'-function in'filter_species_by_group_prevalence'-function.
+library(microViz)
+library(fantaxtic) # for making barplots
+library(gplots) # for enhanced heatmaps
+
+
+```
+
+## Data: Loading and Filtering (relative-Abundance data)
+
+```{r}
+# load metaphlan percentage file (relative abundance file)
+metaphlanData_percent <- read.table("../data/raw/MF_SGB_percent.txt", header = TRUE, sep = "", row.names = 1)
+# convert rownames into first column
+metaphlanData_percent <- rownames_to_column(metaphlanData_percent, var = "clade_name")
+metaphlanData_percent$clade_name <- as.character(metaphlanData_percent$clade_name)
+
+# load metadata file
+metaData <- read.table("../../metadata/metadata_silas.csv", header = TRUE, sep = ",") %>%
+    column_to_rownames(var = "id")
+
+```
+
+check metaphlan percentage file
+
+```{r}
+metaphlanData_percent_check <- metaphlanData_percent %>%
+    select(-clade_name)
+
+summary(colSums(metaphlanData_percent_check))
+```
+
+filter metaphlan data (all ppB) samples
+
+```{r}
+# metaphlanData percentage
+metaphlanData_percent <- metaphlanData_percent[, !grepl("ppB", colnames(metaphlanData_percent))]
+
+```
+
+## Phyloseq-Object
+
+```{r}
+meta_physeq_percent <- metaphlan_to_phyloseq(metaphlanData_percent, metaData, version = 4, verbose = TRUE, tax_lvl = "SGB")
+ps_percent <- meta_physeq_percent
+ps_percent <- subset_taxa(ps_percent, Kingdom != "k__Eukaryota") # remove eukaryotes
+
+
+# check the ps-percent - object
+ps_kingdom <- tax_glom(ps_percent, taxrank = "Kingdom")
+otu_mat <- as(otu_table(ps_kingdom), "matrix")
+# print(otu_mat)
+
+
+# look if we have species without t__
+tax_names <- taxa_names(ps_percent)
+not_t_taxa <- tax_names[!grepl("t__", tax_names)]
+print(not_t_taxa)
+
+```
+
+### Filter Phyloseq-Object based on minimal relative abundance
+
+retain taxa whose average relative abundance across all samples exceeds $10^5$.
+
+```{r}
+ps_percent_filt <- filter_taxa(
+    ps_percent,
+    function(x) mean(x) > 1e-5,
+    prune = TRUE
+)
+```
+
+## Ordination analysis using microViz
+
+### PCA (CLR, SGB)
+```{r}
+# PCA with CLR transformation at SGB level
+pca_ps <- ps_percent_filt %>%
+    tax_transform("clr", rank = "Species") %>%
+    ord_calc(method = "PCA")
+
+
+
+```
+
+```{r}
+pca_plot <- ord_plot(pca_ps, color = "category2", size = 2, plot_taxa = 1:9) +
+  stat_ellipse(aes(color = category2)) +
+  #    ggtitle("PCA (CLR, SGB)") +
+  labs(color = "Category") +
+  scale_color_manual(
+    values = unlist(color_codes$category2),
+    labels = color_codes$label_mapping
+  )
+plot(pca_plot)
+ggsave(
+  "../figures/pca_clr_dim1_and_2.svg",
+  plot = pca_plot,
+  height = 6,
+  width = 8
+)
+```
+
+```{r}
+
+pca_plot <- ord_plot(pca_ps, color = "category2", size = 2, axes = c(1, 3)) +
+    stat_ellipse(aes(color = category2)) +
+    ggtitle("PCA (CLR, SGB)") +
+    labs(color = "Category") +
+    scale_color_manual(values = unlist(color_codes$category2), labels = color_codes$label_mapping)
+plot(pca_plot)
+ggsave("../figures/pca_clr_dim1_and_3.svg", plot = pca_plot, height = 6, width = 8)
+
+```
+
+
+
+### PCoA (Bray-Curtis, SGB)
+```{r}
+# PCoA with Bray-Curtis at SGB level
+pcoa_ps <- ps_percent_filt %>%
+    tax_transform("identity", rank = "SGB") %>%
+    dist_calc("bray") %>%
+    ord_calc(method = "PCoA")
+
+```
+
+
+w30pp show microbiome similar to suckling pigs
+
+
+```{r}
+# Global PERMANOVA for category2 (same Bray-Curtis distance used in PCoA)
+bc_dist_global <- phyloseq::distance(ps_percent_filt, method = "bray")
+metadata_global <- data.frame(sample_data(ps_percent_filt))
+metadata_global <- metadata_global[labels(bc_dist_global), , drop = FALSE]
+
+permanova_global <- vegan::adonis2(
+  bc_dist_global ~ category2,
+  data = metadata_global,
+  permutations = 999
+)
+
+format_p <- function(x) {
+  ifelse(x < 0.001, "<0.001", sprintf("= %.3f", x))
+}
+
+permanova_label <- paste0(
+  "PERMANOVA p ", format_p(permanova_global$`Pr(>F)`[1]),
+  "\nR2 = ", round(permanova_global$R2[1], 3)
+)
+
+pcoa_plot <- ord_plot(pcoa_ps, color = "category2", size = 2, axes = c(1, 2)) +
+    stat_ellipse(aes(group = category2, color = category2)) +
+    #ggtitle("PCoA (Bray-Curtis, SGB)") +
+    labs(color = "Category") +
+    scale_color_manual(values = unlist(color_codes$category2), labels = color_codes$label_mapping)+
+  annotate(
+    "text",
+    x = Inf,
+    y = Inf,
+    label = permanova_label,
+    hjust = 1.1,
+    vjust = 1.5,
+    size = 4,
+    family = "DejaVu Sans"
+  ) +
+  theme_bw(base_family = "DejaVu Sans")+
+  theme(
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 14),
+    legend.title = element_text(size = 13),
+    legend.text = element_text(size = 13),
+    strip.text = element_text(size = 15)
+  )
+
+
+plt_data <- pcoa_plot$data
+
+
+plot(pcoa_plot)
+ggsave("../figures/pcoa_bray_sgb.svg", plot = pcoa_plot, height = 6, width = 8)
+```
+
+
+### PCoA (Bray-Curtis, humans vs pigs)
+
+```{r}
+# Build a binary grouping: Humans vs Pigs
+ps_human_pig <- ps_percent_filt %>%
+  ps_mutate(
+    human_pig_group = case_when(
+      species == "Human" ~ "Humans",
+      species == "Pig" ~ "Pigs",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  ps_filter(!is.na(human_pig_group))
+
+human_pig_pcoa_ps <- ps_human_pig %>%
+  tax_transform("identity", rank = "SGB") %>%
+  dist_calc("bray") %>%
+  ord_calc(method = "PCoA")
+
+# Global PERMANOVA for the binary human/pig grouping
+human_pig_bc_dist <- phyloseq::distance(ps_human_pig, method = "bray")
+human_pig_meta <- data.frame(sample_data(ps_human_pig))
+human_pig_meta <- human_pig_meta[labels(human_pig_bc_dist), , drop = FALSE]
+
+permanova_human_pig <- vegan::adonis2(
+  human_pig_bc_dist ~ human_pig_group,
+  data = human_pig_meta,
+  permutations = 999
+)
+
+format_p_human_pig <- function(x) {
+  ifelse(x < 0.001, "<0.001", sprintf("= %.3f", x))
+}
+
+permanova_human_pig_label <- paste0(
+  "PERMANOVA p ", format_p_human_pig(permanova_human_pig$`Pr(>F)`[1]),
+  "\nR2 = ", round(permanova_human_pig$R2[1], 3)
+)
+
+pcoa_human_pig_plot <- ord_plot(
+  human_pig_pcoa_ps,
+  color = "human_pig_group",
+  size = 2,
+  axes = c(1, 2)
+) +
+  stat_ellipse(aes(group = human_pig_group, color = human_pig_group)) +
+  labs(color = "Group") +
+  scale_color_manual(
+    values = c(
+      "Humans" = "#D4843D",
+      "Pigs" = "#4C9F70"
+    )
+  ) +
+  annotate(
+    "text",
+    x = Inf,
+    y = Inf,
+    label = permanova_human_pig_label,
+    hjust = 1.1,
+    vjust = 1.5,
+    size = 4,
+    family = "DejaVu Sans"
+  ) +
+  theme_bw(base_family = "DejaVu Sans") +
+  theme(
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 14),
+    legend.title = element_text(size = 13),
+    legend.text = element_text(size = 13),
+    strip.text = element_text(size = 15)
+  )
+
+print(permanova_human_pig)
+plot(pcoa_human_pig_plot)
+ggsave("../figures/pcoa_bray_humans_vs_pigs.svg", plot = pcoa_human_pig_plot, height = 6, width = 8)
+```
+
+
+### PCoA (Bray-Curtis, pigs only, growth stages)
+
+```{r}
+# Pig-only subset for growth-stage-specific ordination
+ps_pig <- ps_percent_filt %>%
+  ps_filter(species == "Pig")
+
+pig_pcoa_ps <- ps_pig %>%
+  tax_transform("identity", rank = "SGB") %>%
+  dist_calc("bray") %>%
+  ord_calc(method = "PCoA")
+
+# Global PERMANOVA for growth stage (permutations constrained within farm)
+pig_bc_dist <- phyloseq::distance(ps_pig, method = "bray")
+pig_meta <- data.frame(sample_data(ps_pig))
+pig_meta <- pig_meta[labels(pig_bc_dist), , drop = FALSE]
+
+permanova_growth_global <- vegan::adonis2(
+  pig_bc_dist ~ growth_stage,
+  data = pig_meta,
+  permutations = 999,
+  strata = pig_meta$farm
+)
+
+format_p_growth <- function(x) {
+  ifelse(x < 0.001, "<0.001", sprintf("= %.3f", x))
+}
+
+permanova_growth_label <- paste0(
+  "PERMANOVA p ", format_p_growth(permanova_growth_global$`Pr(>F)`[1]),
+  "\nR2 = ", round(permanova_growth_global$R2[1], 3)
+)
+
+pcoa_growth_plot <- ord_plot(pig_pcoa_ps, color = "growth_stage", size = 2, axes = c(1, 2)) +
+  stat_ellipse(aes(group = growth_stage, color = growth_stage)) +
+  labs(color = "Growth stage") +
+  scale_color_manual(values = unlist(color_codes$pig_stages)) +
+  annotate(
+    "text",
+    x = Inf,
+    y = Inf,
+    label = permanova_growth_label,
+    hjust = 1.1,
+    vjust = 1.5,
+    size = 4,
+    family = "DejaVu Sans"
+  ) +
+  theme_bw(base_family = "DejaVu Sans") +
+  theme(
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 14),
+    legend.title = element_text(size = 13),
+    legend.text = element_text(size = 13),
+    strip.text = element_text(size = 15)
+  )
+
+print(permanova_growth_global)
+plot(pcoa_growth_plot)
+ggsave("../figures/pcoa_bray_sgb_growth_stage_only.svg", plot = pcoa_growth_plot, height = 6, width = 8, web_fonts = "DejaVu Sans")
+```
+
+
+
+## PERMANOVA 
+
+```{r}
+# H0: Human vs Pig is the strongest factor
+# This should have the highest R² value
+
+permanova_h0_species <- ps_percent_filt %>%
+    tax_transform("identity", rank = "SGB") %>%
+    dist_calc("bray") %>%
+    dist_permanova(
+        variables = "species",
+        n_perms = 999,
+        seed = 42
+    )
+
+print("H0: Human vs Pig (strongest factor):")
+print(permanova_h0_species)
+
+```
+
+human pig R2=0.20
+
+
+```{r}
+# H1 + H3 combined: Test growth_stage effect across ALL pigs
+# This tests: are there differences among growth stages?
+# Expected: suckling vs non-suckling >> weaning vs fattening
+
+permanova_h1_h3_combined <- ps_percent_filt %>%
+  ps_filter(species == "Pig") %>%
+  tax_transform("identity", rank = "SGB") %>%
+  dist_calc("bray") %>%
+  dist_permanova(
+    variables = c("growth_stage","farm"),
+    n_perms = 999,
+    seed = 42
+  )
+
+print("H1+H3: Growth stage effect in all pigs:")
+print(permanova_h1_h3_combined)
+
+# Pairwise PERMANOVA to see which groups differ
+# This shows: suckling vs weaning, suckling vs fattening, weaning vs fattening
+pig_bc_dist <- phyloseq::distance(
+  ps_percent_filt %>% ps_filter(species == "Pig"), 
+  method = "bray"
+)
+
+pig_metadata_full <- data.frame(sample_data(ps_percent_filt)) %>%
+  filter(species == "Pig")
+
+# Pairwise comparisons using pairwiseAdonis
+library(pairwiseAdonis)
+pairwise_growth <- pairwise.adonis2(
+  pig_bc_dist ~ growth_stage + farm,
+  data = pig_metadata_full,
+  nperm = 999
+)
+
+print("Pairwise comparisons between growth stages:")
+print(pairwise_growth)
+
+```
+
+All pig groups are different.
+
+suckling pigs are more different than others. 
+
+Suckling_vs_Weaning R2=0.38
+Fattening_vs_Weaning R2= 0.14
+
+Farm is not significant
+
+
+
+
+```{r}
+
+
+
+# H4: Farm is NOT important (accounting for pooling of samples)
+# Note: If each sample is a pool of pigs from different growth stages on the same farm,
+# we should test farm effect WITHIN each growth stage separately
+
+# H4a: Farm effect across all pig samples
+permanova_h4_overall <- ps_percent_filt %>%
+  ps_filter(species == "Pig") %>%
+  tax_transform("identity", rank = "SGB") %>%
+  dist_calc("bray") %>%
+  dist_permanova(
+    variables = "farm",
+    n_perms = 999,
+    seed = 42
+  )
+
+print("H4a: Farm effect in pigs (overall):")
+print(permanova_h4_overall)
+
+# H4b: Test farm effect WITHIN growth stages (using strata)
+# Permutations are restricted within growth stages
+pig_bc_dist <- phyloseq::distance(
+  ps_percent_filt %>% ps_filter(species == "Pig"), 
+  method = "bray"
+)
+
+pig_metadata_full <- data.frame(sample_data(ps_percent_filt)) %>%
+  filter(species == "Pig")
+
+permanova_h4_stratified <- adonis2(
+  pig_bc_dist ~ farm,
+  data = pig_metadata_full,
+  permutations = 999,
+  strata = pig_metadata_full$growth_stage  # Block by growth stage
+)
+
+print("H4b: Farm effect blocking by growth_stage:")
+print(permanova_h4_stratified)
+
+# H4c: Sequential test - which is stronger: growth_stage or farm?
+permanova_h4_sequential <- adonis2(
+  pig_bc_dist ~ growth_stage + farm,
+  data = pig_metadata_full,
+  permutations = 999,
+  by = "terms"  # Sequential: growth_stage first, then farm
+)
+
+print("H4c: Sequential PERMANOVA (growth_stage + farm):")
+print(permanova_h4_sequential)
+
+# H4d: Marginal test - independent effect of each after accounting for the other
+permanova_h4_marginal <- adonis2(
+  pig_bc_dist ~ growth_stage + farm,
+  data = pig_metadata_full,
+  permutations = 999,
+  by = "margin"  # Marginal effects
+)
+
+print("H4d: Marginal PERMANOVA (growth_stage + farm):")
+print(permanova_h4_marginal)
+
+```
+
+
+
+```{r}
+
+# H5: Farmers vs Controls vs Pigs
+# Interpretation:
+# - This tests if the 4 categories differ in composition
+# - High R² = strong differences among all groups
+# - Post-hoc pairwise tests tell you WHICH groups differ
+# - Expected: Pigs cluster separately from humans, farmers may be intermediate
+
+permanova_h5 <- ps_percent_filt %>%
+  #ps_filter(category2 %in% c("Pig_farmers", "Non_farmer_controls", "Older_pigs", "Weaning_pigs")) %>%
+  tax_transform("identity", rank = "SGB") %>%
+  dist_calc("bray") %>%
+  dist_permanova(
+    variables = "category2",
+    n_perms = 999,
+    seed = 42
+  )
+
+print("H5: Farmers vs Controls vs Pigs:")
+print(permanova_h5)
+
+# Pairwise comparisons for H5
+#h5_subset <- ps_percent_filt %>%
+  #ps_filter(category2 %in% c("Pig_farmers", "Non_farmer_controls", "Older_pigs", "Weaning_pigs"))
+
+h5_bc_dist <- phyloseq::distance(ps_percent_filt, method = "bray")
+h5_metadata <- data.frame(sample_data(ps_percent_filt))
+
+library(pairwiseAdonis)
+pairwise_h5 <- vegan::pairwise.adonis2(
+  h5_bc_dist ~ category2,
+  data = h5_metadata,
+  nperm = 999
+)
+
+print("Pairwise comparisons for H5:")
+print(pairwise_h5)
+
+
+```
+
+
+
+
+
+```{r}
+
+metadata <- data.frame(sample_data(ps_percent_filt))
+bc_dist <- phyloseq::distance(ps_percent_filt, method = "bray")
+
+# Get sample names
+farmer_samples <- rownames(metadata)[metadata$category2 == "Pig_farmers"]
+control_samples <- rownames(metadata)[metadata$category2 == "Non_farmer_controls"]
+older_pig_samples <- rownames(metadata)[metadata$category2 == "Older_pigs"]
+
+bc_matrix <- as.matrix(bc_dist)
+
+# Calculate mean distance from each farmer to all older pigs
+farmer_mean_dists <- sapply(farmer_samples, function(farmer) {
+  mean(bc_matrix[farmer, older_pig_samples])
+})
+
+# Calculate mean distance from each control to all older pigs
+control_mean_dists <- sapply(control_samples, function(control) {
+  mean(bc_matrix[control, older_pig_samples])
+})
+
+# Now you have ONE value per human sample (independent observations)
+wilcox_corrected <- wilcox.test(farmer_mean_dists, control_mean_dists, 
+                                alternative = "less")
+
+cat("Mean distance per sample approach:\n")
+cat("Farmers (n=", length(farmer_mean_dists), "):\n")
+cat("  Mean:", mean(farmer_mean_dists), "\n")
+cat("  Median:", median(farmer_mean_dists), "\n")
+
+cat("\nControls (n=", length(control_mean_dists), "):\n")
+cat("  Mean:", mean(control_mean_dists), "\n")
+cat("  Median:", median(control_mean_dists), "\n")
+
+cat("\nWilcoxon test (per-sample means):\n")
+cat("  W:", wilcox_corrected$statistic, "\n")
+cat("  P-value:", wilcox_corrected$p.value, "\n")
+
+# Effect size
+cohen_d <- (mean(farmer_mean_dists) - mean(control_mean_dists)) / 
+           sqrt((sd(farmer_mean_dists)^2 + sd(control_mean_dists)^2) / 2)
+cat("  Cohen's d:", cohen_d, "\n")
+
+# Visualize
+plot_data <- data.frame(
+  distance = c(farmer_mean_dists, control_mean_dists),
+  group = c(rep("Farmers", length(farmer_mean_dists)),
+            rep("Controls", length(control_mean_dists)))
+)
+
+library(ggplot2)
+
+# Format p-values for plot labels
+format_p <- function(x) {
+  ifelse(x < 0.001, "<0.001", sprintf("= %.3f", x))
+}
+
+stat_label <- paste0(
+  "Wilcoxon p ", format_p(wilcox_corrected$p.value),
+  "\nCohen's d = ", round(cohen_d, 2)
+)
+
+p <- ggplot(plot_data, aes(x = group, y = distance, fill = group)) +
+  geom_boxplot(width = 0.2, alpha = 0.8) +
+  geom_jitter(width = 0.2, alpha = 0.4, size = 2) +
+  theme_bw(base_size = 12, base_family = "DejaVu Sans") +
+  labs(
+    # title = "Mean Bray-Curtis Distance to Older Pigs",
+    # subtitle = paste0("Each point = one human sample's mean distance to all Older_pig samples\n",
+                     #"Wilcoxon p = ", format(wilcox_corrected$p.value, digits = 3),
+                     #", Cohen's d = ", round(cohen_d, 3)),
+    x = "",
+    y = "Mean Bray-Curtis Distance to Older Pigs"
+  ) +
+  annotate(
+    "text",
+    x = 1.5,
+    y = max(plot_data$distance, na.rm = TRUE) * 1.08,
+    label = stat_label,
+    family = "DejaVu Sans",
+    size = 4
+  ) +
+  scale_y_continuous(expand = expansion(mult = c(0.02, 0.18))) +
+  scale_fill_manual(values = c("Farmers" = "#D4843D", "Controls" = "#4A7C7E"))+
+  theme_publication()+
+  theme(legend.position = "none")
+
+print(p)
+ggsave("../figures/per_sample_mean_distance.svg", p, width = 5, height = 6)
+
+```
+
+```{r}
+
+library(lme4)
+library(lmerTest)
+
+bc_dist <- phyloseq::distance(ps_percent_filt, method = "bray")
+
+# Prepare data: each row is a distance between a human and a pig
+human_samples <- c(farmer_samples, control_samples)
+distance_data <- data.frame()
+
+for (human in human_samples) {
+  for (pig in older_pig_samples) {
+    distance_data <- rbind(distance_data, data.frame(
+      human_id = human,
+      pig_id = pig,
+      distance = bc_matrix[human, pig],
+      group = metadata[human, "category2"]
+    ))
+  }
+}
+
+# Mixed model: group as fixed effect, human and pig as random effects
+model <- lmer(distance ~ group + (1|human_id) + (1|pig_id), 
+              data = distance_data)
+
+summary(model)
+anova(model)
+
+```
+
+
+# Within group and between group
+
+```{r}
+
+# Load required libraries
+library(phyloseq)
+library(vegan)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+# Assuming your phyloseq object is called 'ps'
+# Extract metadata
+metadata <- data.frame(sample_data(ps_percent_filt))
+
+# Calculate Bray-Curtis distance matrix
+bc_dist <- phyloseq::distance(ps_percent_filt, method = "bray")
+bc_matrix <- as.matrix(bc_dist)
+
+# Create a function to extract distances by category pairs
+extract_distances <- function(dist_matrix, metadata, category_col = "category2") {
+  
+  distances_df <- data.frame()
+  
+  samples <- rownames(dist_matrix)
+  categories <- metadata[[category_col]][match(samples, rownames(metadata))]
+  
+  # Loop through all pairs of samples
+  for (i in 1:(length(samples)-1)) {
+    for (j in (i+1):length(samples)) {
+      distances_df <- rbind(distances_df, data.frame(
+        sample1 = samples[i],
+        sample2 = samples[j],
+        category1 = categories[i],
+        category2 = categories[j],
+        distance = dist_matrix[i, j],
+        comparison_type = ifelse(categories[i] == categories[j], "Within", "Between"),
+        category_pair = ifelse(categories[i] == categories[j], 
+                               categories[i],
+                               paste(sort(c(categories[i], categories[j])), collapse = " vs "))
+      ))
+    }
+  }
+  
+  return(distances_df)
+}
+
+# Extract all pairwise distances
+distances_df <- extract_distances(bc_matrix, metadata)
+```
+
+```{r}
+# Summarize within-category distances
+within_distances <- distances_df %>%
+  filter(comparison_type == "Within") %>%
+  group_by(category_pair) %>%
+  summarise(
+    mean_distance = mean(distance),
+    median_distance = median(distance),
+    sd_distance = sd(distance),
+    n_comparisons = n()
+  )
+
+print("Within-category distances:")
+print(within_distances)
+
+# Summarize between-category distances
+between_distances <- distances_df %>%
+  filter(comparison_type == "Between") %>%
+  group_by(category_pair) %>%
+  summarise(
+    mean_distance = mean(distance),
+    median_distance = median(distance),
+    sd_distance = sd(distance),
+    n_comparisons = n()
+  )
+
+print("\nBetween-category distances:")
+print(between_distances)
+
+```
+
+```{r}
+# Extract specific comparisons for hypothesis testing
+# Farmers to Older_pigs
+farmers_to_older <- distances_df %>%
+  filter((category1 == "Pig_farmers" & category2 == "Older_pigs") |
+         (category1 == "Older_pigs" & category2 == "Pig_farmers")) %>%
+  pull(distance)
+
+# Controls to Older_pigs
+controls_to_older <- distances_df %>%
+  filter((category1 == "Non_farmer_controls" & category2 == "Older_pigs") |
+         (category1 == "Older_pigs" & category2 == "Non_farmer_controls")) %>%
+  pull(distance)
+
+# Statistical test: Wilcoxon rank-sum test (Mann-Whitney U)
+# Testing if farmers are closer (smaller distances) to Older_pigs than controls
+wilcox_test <- wilcox.test(farmers_to_older, controls_to_older, 
+                           alternative = "less")  # one-sided: farmers < controls
+
+print("\n=== Statistical Test Results ===")
+print("H0: Farmers and Controls are equally distant from Older_pigs")
+print("H1: Farmers are closer to Older_pigs than Controls (distances are smaller)")
+cat("\nFarmers to Older_pigs:")
+cat("\n  Mean distance:", mean(farmers_to_older))
+cat("\n  Median distance:", median(farmers_to_older))
+cat("\n  N comparisons:", length(farmers_to_older))
+
+cat("\n\nControls to Older_pigs:")
+cat("\n  Mean distance:", mean(controls_to_older))
+cat("\n  Median distance:", median(controls_to_older))
+cat("\n  N comparisons:", length(controls_to_older))
+
+cat("\n\nWilcoxon rank-sum test:")
+cat("\n  W statistic:", wilcox_test$statistic)
+cat("\n  P-value:", wilcox_test$p.value)
+cat("\n  Significant at α=0.05:", wilcox_test$p.value < 0.05)
+
+# Alternative: permutation test for more robust results
+set.seed(123)
+n_perm <- 9999
+
+observed_diff <- mean(farmers_to_older) - mean(controls_to_older)
+combined <- c(farmers_to_older, controls_to_older)
+n_farmers <- length(farmers_to_older)
+n_total <- length(combined)
+
+perm_diffs <- replicate(n_perm, {
+  shuffled <- sample(combined)
+  mean(shuffled[1:n_farmers]) - mean(shuffled[(n_farmers+1):n_total])
+})
+
+perm_pvalue <- mean(perm_diffs <= observed_diff)
+
+cat("\n\nPermutation test (", n_perm, " permutations):")
+cat("\n  Observed difference:", observed_diff)
+cat("\n  P-value:", perm_pvalue)
+cat("\n  Significant at α=0.05:", perm_pvalue < 0.05)
+
+# helper for readable p-values in plot subtitles
+fmt_p <- function(x) {
+  ifelse(x < 0.001, "<0.001", sprintf("%.3f", x))
+}
+
+# Visualization 1: Boxplot comparison
+plot_data <- data.frame(
+  distance = c(farmers_to_older, controls_to_older),
+  group = c(rep("Farmers → Older_pigs", length(farmers_to_older)),
+            rep("Controls → Older_pigs", length(controls_to_older)))
+)
+
+p1 <- ggplot(plot_data, aes(x = group, y = distance, fill = group)) +
+  geom_boxplot(alpha = 0.7) +
+  geom_jitter(width = 0.2, alpha = 0.3, size = 2) +
+  theme_bw(base_family = "DejaVu Sans") +
+  labs(
+    title = "Bray-Curtis Distance to Older Pigs",
+    subtitle = paste0(
+      "Wilcoxon p = ", fmt_p(wilcox_test$p.value),
+      " | Permutation p = ", fmt_p(perm_pvalue),
+      " | Δmean = ", sprintf("%.3f", observed_diff)
+    ),
+    x = "",
+    y = "Bray-Curtis Distance"
+  ) +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(p1)
+ggsave("../figures/farmers_vs_controls_to_older_pigs.svg", p1, width = 6, height = 5)
+
+# Visualization 2: All between-category comparisons
+between_plot_data <- distances_df %>%
+  filter(comparison_type == "Between") %>%
+  mutate(category_pair = factor(category_pair))
+
+# Omnibus test across all between-category pairs
+kw_between <- kruskal.test(distance ~ category_pair, data = between_plot_data)
+
+p2 <- ggplot(between_plot_data, aes(x = category_pair, y = distance)) +
+  geom_boxplot(alpha = 0.7, fill = "steelblue") +
+  theme_bw(base_family = "DejaVu Sans") +
+  labs(
+    title = "Between-Category Bray-Curtis Distances",
+    subtitle = paste0("Kruskal-Wallis p = ", fmt_p(kw_between$p.value)),
+    x = "Category Comparison",
+    y = "Bray-Curtis Distance"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(p2)
+ggsave("../figures/between_category_distances.svg", p2, width = 10, height = 5)
+
+# Visualization 3: Within vs Between comparison
+all_distances_plot <- distances_df %>%
+  mutate(category_pair = factor(category_pair))
+
+# Global within-vs-between test
+wilcox_within_between <- wilcox.test(
+  distance ~ comparison_type,
+  data = all_distances_plot,
+  alternative = "two.sided"
+)
+
+p3 <- ggplot(all_distances_plot, aes(x = category_pair, y = distance, fill = comparison_type)) +
+  geom_boxplot(alpha = 0.7) +
+  theme_bw(base_family = "DejaVu Sans") +
+  labs(
+    title = "Within- and Between-Category Bray-Curtis Distances",
+    subtitle = paste0("Within vs Between Wilcoxon p = ", fmt_p(wilcox_within_between$p.value)),
+    x = "Category",
+    y = "Bray-Curtis Distance",
+    fill = "Comparison Type"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_manual(values = c("Within" = "#2E7D32", "Between" = "#1976D2"))
+
+print(p3)
+ggsave("../figures/within_vs_between_distances.svg", p3, width = 12, height = 6)
+
+
+```
+
+
+
+## Farm-Based Distance Analysis
+
+```{r}
+# Function to extract distances by farm pairs
+extract_farm_distances <- function(dist_matrix, metadata) {
+  
+  distances_df <- data.frame()
+  
+  samples <- rownames(dist_matrix)
+  farms <- metadata$farm[match(samples, rownames(metadata))]
+  
+  # Loop through all pairs of samples
+  for (i in 1:(length(samples)-1)) {
+    for (j in (i+1):length(samples)) {
+      distances_df <- rbind(distances_df, data.frame(
+        sample1 = samples[i],
+        sample2 = samples[j],
+        farm1 = farms[i],
+        farm2 = farms[j],
+        distance = dist_matrix[i, j],
+        comparison_type = ifelse(farms[i] == farms[j], "Same Farm", "Different Farms"),
+        farm_pair = ifelse(farms[i] == farms[j], 
+                           as.character(farms[i]),
+                           paste(sort(c(as.character(farms[i]), as.character(farms[j]))), collapse = " vs "))
+      ))
+    }
+  }
+  
+  return(distances_df)
+}
+
+
+ps_percent_farm <- ps_percent_filt %>%
+  ps_filter(category2 != "Non_farmer_controls")  # Focus on pig samples for farm analysis
+
+metadata_filt <- data.frame(sample_data(ps_percent_farm))
+rownames(metadata_filt) <- sample_names(ps_percent_farm)
+bc_dist_filt <- phyloseq::distance(ps_percent_farm, method = "bray")
+bc_matrix_filt <- as.matrix(bc_dist_filt)
+
+# Extract farm-based distances (using filtered phyloseq without controls/suckling)
+farm_distances_df <- extract_farm_distances(bc_matrix_filt, metadata_filt)
+
+# Summarize same-farm distances
+same_farm_distances <- farm_distances_df %>%
+  filter(comparison_type == "Same Farm") %>%
+  group_by(farm_pair) %>%
+  summarise(
+    mean_distance = mean(distance),
+    median_distance = median(distance),
+    sd_distance = sd(distance),
+    n_comparisons = n()
+  )
+
+print("Same-farm distances:")
+print(same_farm_distances)
+
+# Summarize different-farm distances
+different_farm_distances <- farm_distances_df %>%
+  filter(comparison_type == "Different Farms") %>%
+  summarise(
+    mean_distance = mean(distance),
+    median_distance = median(distance),
+    sd_distance = sd(distance),
+    n_comparisons = n()
+  )
+
+print("\nDifferent-farm distances:")
+print(different_farm_distances)
+
+# Statistical test: Same farm vs Different farms
+same_farm_vals <- farm_distances_df %>%
+  filter(comparison_type == "Same Farm") %>%
+  pull(distance)
+
+diff_farm_vals <- farm_distances_df %>%
+  filter(comparison_type == "Different Farms") %>%
+  pull(distance)
+
+wilcox_farm_test <- wilcox.test(same_farm_vals, diff_farm_vals, 
+                                 alternative = "less")
+
+cat("\n=== Farm-Based Distance Test ===")
+cat("\nH0: Same-farm and different-farm distances are equal")
+cat("\nH1: Same-farm distances are smaller than different-farm distances")
+cat("\n\nSame farm:")
+cat("\n  Mean distance:", mean(same_farm_vals))
+cat("\n  Median distance:", median(same_farm_vals))
+cat("\n  N comparisons:", length(same_farm_vals))
+
+cat("\n\nDifferent farms:")
+cat("\n  Mean distance:", mean(diff_farm_vals))
+cat("\n  Median distance:", median(diff_farm_vals))
+cat("\n  N comparisons:", length(diff_farm_vals))
+
+cat("\n\nWilcoxon rank-sum test:")
+cat("\n  W statistic:", wilcox_farm_test$statistic)
+cat("\n  P-value:", wilcox_farm_test$p.value)
+cat("\n  Significant at α=0.05:", wilcox_farm_test$p.value < 0.05)
+
+# Visualization: Same farm vs Different farms
+farm_plot_data <- data.frame(
+  distance = c(same_farm_vals, diff_farm_vals),
+  comparison = c(rep("Same Farm", length(same_farm_vals)),
+                 rep("Different Farms", length(diff_farm_vals)))
+)
+
+p_farm <- ggplot(farm_plot_data, aes(x = comparison, y = distance, fill = comparison)) +
+  geom_boxplot(alpha = 0.7) +
+  geom_jitter(width = 0.2, alpha = 0.3, size = 1) +
+  theme_bw(base_family = "DejaVu Sans") +
+  labs(
+    title = "Bray-Curtis Distances: Same vs Different Farms",
+    subtitle = paste0("Wilcoxon test p-value: ", format(wilcox_farm_test$p.value, digits = 3)),
+    x = "",
+    y = "Bray-Curtis Distance"
+  ) +
+  theme(legend.position = "none") +
+  scale_fill_manual(values = c("Same Farm" = "#4CAF50", "Different Farms" = "#FF9800"))
+
+print(p_farm)
+ggsave("../figures/same_vs_different_farm_distances.pdf", p_farm, width = 6, height = 5)
+
+# Enhanced analysis: Species type + Farm comparison
+# Add species information to farm distances
+farm_distances_df_species <- farm_distances_df %>%
+  mutate(
+    species1 = metadata_filt$species[match(sample1, rownames(metadata_filt))],
+    species2 = metadata_filt$species[match(sample2, rownames(metadata_filt))],
+    species_pair = case_when(
+      species1 == "Human" & species2 == "Human" ~ "Human-Human",
+      species1 == "Pig" & species2 == "Pig" ~ "Pig-Pig",
+      TRUE ~ "Human-Pig"
+    ),
+    comparison_detailed = paste(species_pair, comparison_type, sep = " | ")
+  )
+
+# Summarize by species pair and farm status
+species_farm_summary <- farm_distances_df_species %>%
+  group_by(species_pair, comparison_type) %>%
+  summarise(
+    mean_distance = mean(distance),
+    median_distance = median(distance),
+    sd_distance = sd(distance),
+    n_comparisons = n(),
+    .groups = "drop"
+  )
+
+print("\nSpecies-Farm Distance Summary:")
+print(species_farm_summary)
+
+# Statistical tests for each species pair
+# Human-Human same vs different farm
+hh_same <- farm_distances_df_species %>%
+  filter(species_pair == "Human-Human", comparison_type == "Same Farm") %>%
+  pull(distance)
+hh_diff <- farm_distances_df_species %>%
+  filter(species_pair == "Human-Human", comparison_type == "Different Farms") %>%
+  pull(distance)
+
+# Pig-Pig same vs different farm
+pp_same <- farm_distances_df_species %>%
+  filter(species_pair == "Pig-Pig", comparison_type == "Same Farm") %>%
+  pull(distance)
+pp_diff <- farm_distances_df_species %>%
+  filter(species_pair == "Pig-Pig", comparison_type == "Different Farms") %>%
+  pull(distance)
+
+# Human-Pig same vs different farm
+hp_same <- farm_distances_df_species %>%
+  filter(species_pair == "Human-Pig", comparison_type == "Same Farm") %>%
+  pull(distance)
+hp_diff <- farm_distances_df_species %>%
+  filter(species_pair == "Human-Pig", comparison_type == "Different Farms") %>%
+  pull(distance)
+
+cat("\n=== Species-Farm Distance Tests ===\n")
+
+if (length(hh_same) > 0 & length(hh_diff) > 0) {
+  wilcox_hh <- wilcox.test(hh_same, hh_diff, alternative = "less")
+  cat("\nHuman-Human:")
+  cat("\n  Same farm (n=", length(hh_same), "): mean=", mean(hh_same), ", median=", median(hh_same))
+  cat("\n  Diff farm (n=", length(hh_diff), "): mean=", mean(hh_diff), ", median=", median(hh_diff))
+  cat("\n  Wilcoxon p-value:", wilcox_hh$p.value)
+}
+
+if (length(pp_same) > 0 & length(pp_diff) > 0) {
+  wilcox_pp <- wilcox.test(pp_same, pp_diff, alternative = "less")
+  cat("\n\nPig-Pig:")
+  cat("\n  Same farm (n=", length(pp_same), "): mean=", mean(pp_same), ", median=", median(pp_same))
+  cat("\n  Diff farm (n=", length(pp_diff), "): mean=", mean(pp_diff), ", median=", median(pp_diff))
+  cat("\n  Wilcoxon p-value:", wilcox_pp$p.value)
+}
+
+if (length(hp_same) > 0 & length(hp_diff) > 0) {
+  wilcox_hp <- wilcox.test(hp_same, hp_diff, alternative = "less")
+  cat("\n\nHuman-Pig:")
+  cat("\n  Same farm (n=", length(hp_same), "): mean=", mean(hp_same), ", median=", median(hp_same))
+  cat("\n  Diff farm (n=", length(hp_diff), "): mean=", mean(hp_diff), ", median=", median(hp_diff))
+  cat("\n  Wilcoxon p-value:", wilcox_hp$p.value)
+}
+
+# Visualization: Species-specific farm comparisons
+p_species_farm <- ggplot(farm_distances_df_species, 
+                         aes(x = species_pair, y = distance, fill = comparison_type)) +
+  geom_boxplot(alpha = 0.7, position = position_dodge(0.8)) +
+  theme_bw(base_family = "DejaVu Sans") +
+  labs(
+    title = "Bray-Curtis Distances by Species Pair and Farm Status",
+    subtitle = "Comparing same vs different farm within species pairs",
+    x = "Species Comparison",
+    y = "Bray-Curtis Distance",
+    fill = "Farm Status"
+  ) +
+  scale_fill_manual(values = c("Same Farm" = "#4CAF50", "Different Farms" = "#FF9800"))
+
+print(p_species_farm)
+ggsave("../figures/species_farm_distances.svg", p_species_farm, width = 8, height = 6)
+
+# Alternative visualization: Faceted by species pair
+p_species_farm_facet <- ggplot(farm_distances_df_species, 
+                                aes(x = comparison_type, y = distance, fill = comparison_type)) +
+  geom_boxplot(alpha = 0.7) +
+  geom_jitter(width = 0.2, alpha = 0.3, size = 0.8) +
+  facet_wrap(~species_pair, scales = "free_y") +
+  theme_bw(base_family = "DejaVu Sans") +
+  labs(
+    title = "Bray-Curtis Distances: Same vs Different Farm by Species Pair",
+    x = "",
+    y = "Bray-Curtis Distance"
+  ) +
+  theme(legend.position = "none",
+        #axis.text.x = element_text(angle = 45, hjust = 1)
+        ) +
+  scale_fill_manual(values = c("Same Farm" = "#4CAF50", "Different Farms" = "#FF9800"))
+
+print(p_species_farm_facet)
+ggsave("../figures/species_farm_distances_facet.svg", p_species_farm_facet, width = 7, height = 4, web_font = "DejaVu Sans")
+```
+
+
+
+
+ 
+#### Taxa associations with PCoA axes (Hellinger+envfit & Spearman correlations)
+
+
+``` 
+
+
+# takes very long
+
+
+# Extract ordination object and sample scores
+ord_obj <- ord_get(pcoa_ps)
+sample_scores <- scores(ord_obj, display = "sites") %>% as.data.frame()
+
+# Ensure we have at least two axes
+n_axes <- min(ncol(sample_scores), 3)
+print(paste("Number of PCoA axes available:", ncol(sample_scores)))
+
+# Convert otu_table to sample x taxa matrix
+otu_mat <- as(otu_table(ps_percent_filt), "matrix")
+if (taxa_are_rows(ps_percent_filt)) otu_mat <- t(otu_mat)
+
+# Hellinger-transform taxa (recommended before envfit/correlation)
+X_hell <- decostand(otu_mat, method = "hellinger")
+
+## envfit-style taxa fitting using vegan
+fit_taxa <- vegan::envfit(as.matrix(sample_scores[, 1:n_axes]), X_hell, permutations = 999)
+
+# Extract vectors and statistics
+vecs <- as.data.frame(fit_taxa$vectors$arrows)
+colnames(vecs) <- paste0("Axis", 1:ncol(vecs))
+vecs$Taxa <- rownames(fit_taxa$vectors$arrows)
+vecs$r <- fit_taxa$vectors$r
+vecs$pval <- fit_taxa$vectors$pvals
+
+# Filter significant taxa (p < 0.05)
+sig_vecs <- vecs %>% filter(pval < 0.05) %>% arrange(desc(abs(r)))
+print("Top significant taxa from envfit (r, p):")
+print(head(sig_vecs, 20))
+
+# Prepare to plot arrows on the PCoA
+if (nrow(sig_vecs) > 0) {
+    if (n_axes >= 2) {
+        # Determine scale to make arrows visible relative to site scores
+        site_range <- apply(sample_scores[, 1:2, drop = FALSE], 2, function(v) diff(range(v, na.rm = TRUE)))
+        vec_range <- apply(sig_vecs[, 1:2, drop = FALSE], 2, function(v) diff(range(v, na.rm = TRUE)))
+        scale_factor <- min(site_range / (vec_range + 1e-8), na.rm = TRUE) * 0.5
+        sig_vecs$x_end <- sig_vecs$Axis1 * scale_factor
+        sig_vecs$y_end <- sig_vecs$Axis2 * scale_factor
+    } else {
+        # single-axis ordination: map Axis1 into X-axis
+        site_range <- diff(range(sample_scores[, 1], na.rm = TRUE))
+        vec_range <- diff(range(sig_vecs$Axis1, na.rm = TRUE))
+        scale_factor <- (site_range / (vec_range + 1e-8)) * 0.5
+        sig_vecs$x_end <- sig_vecs$Axis1 * scale_factor
+        sig_vecs$y_end <- 0
+    }
+
+    # Add arrows and labels to the PCoA plot
+    pcoa_envfit_plot <- pcoa_plot +
+        geom_segment(data = sig_vecs, aes(x = 0, y = 0, xend = x_end, yend = y_end),
+                                 arrow = arrow(length = unit(0.2, "cm")), colour = "black") +
+        geom_text(data = sig_vecs, aes(x = x_end, y = y_end, label = Taxa), size = 2, hjust = 0.5, vjust = -0.5)
+
+    plot(pcoa_envfit_plot)
+    ggsave("../figures/pcoa_bray_sgb_envfit.svg", plot = pcoa_envfit_plot, height = 6, width = 8)
+}
+
+## Spearman correlation approach (Hellinger taxa vs axes)
+cor_results <- data.frame(Taxa = colnames(X_hell))
+cor_results$Cor_Axis1 <- apply(X_hell, 2, function(z) cor(z, sample_scores[, 1], method = "spearman", use = "complete.obs"))
+cor_results$Pval_Axis1 <- apply(X_hell, 2, function(z) cor.test(z, sample_scores[, 1], method = "spearman", exact = FALSE)$p.value)
+cor_results$Padj_Axis1 <- p.adjust(cor_results$Pval_Axis1, method = "fdr")
+
+cor_results$Cor_Axis2 <- apply(X_hell, 2, function(z) cor(z, sample_scores[, 2], method = "spearman", use = "complete.obs"))
+cor_results$Pval_Axis2 <- apply(X_hell, 2, function(z) cor.test(z, sample_scores[, 2], method = "spearman", exact = FALSE)$p.value)
+cor_results$Padj_Axis2 <- p.adjust(cor_results$Pval_Axis2, method = "fdr")
+
+if (n_axes >= 3) {
+  cor_results$Cor_Axis3 <- apply(X_hell, 2, function(z) cor(z, sample_scores[, 3], method = "spearman", use = "complete.obs"))
+  cor_results$Pval_Axis3 <- apply(X_hell, 2, function(z) cor.test(z, sample_scores[, 3], method = "spearman", exact = FALSE)$p.value)
+  cor_results$Padj_Axis3 <- p.adjust(cor_results$Pval_Axis3, method = "fdr")
+}
+
+# Top taxa for axis 1/2/3 by abs(correlation), FDR < 0.05
+top_cor_axis1 <- cor_results %>% filter(Padj_Axis1 < 0.05) %>% arrange(desc(abs(Cor_Axis1)))
+top_cor_axis2 <- cor_results %>% filter(Padj_Axis2 < 0.05) %>% arrange(desc(abs(Cor_Axis2)))
+if (n_axes >= 3) top_cor_axis3 <- cor_results %>% filter(Padj_Axis3 < 0.05) %>% arrange(desc(abs(Cor_Axis3)))
+
+print("Top taxa (Spearman) Axis 1:")
+print(head(top_cor_axis1, 10))
+print("Top taxa (Spearman) Axis 2:")
+print(head(top_cor_axis2, 10))
+if (n_axes >= 3) print("Top taxa (Spearman) Axis 3:")
+if (n_axes >= 3) print(head(top_cor_axis3, 10))
+
+# Save the correlation results
+write.csv(cor_results, "../data/processed/pcoa_taxa_correlations_spearman_hellinger.csv", row.names = FALSE)
+
+## Biplot showing top taxa (union of envfit and correlation results)
+top_taxa <- unique(c(
+    if (exists("sig_vecs") && nrow(sig_vecs) > 0) head(sig_vecs$Taxa, 10) else NULL,
+    if (exists("top_cor_axis1") && nrow(top_cor_axis1) > 0) head(top_cor_axis1$Taxa, 10) else NULL,
+    if (exists("top_cor_axis2") && nrow(top_cor_axis2) > 0) head(top_cor_axis2$Taxa, 10) else NULL
+))
+if (length(top_taxa) > 0) {
+    # Convert taxa names to indices for plot_taxa (robust to microViz expectations)
+    top_taxa_idx <- which(taxa_names(ps_percent_filt) %in% top_taxa)
+    # Use microViz plotting to overlay top taxa labels/arrows
+    pcoa_taxa_plot <- ord_plot(pcoa_ps, color = "category2", size = 2, plot_taxa = top_taxa_idx) +
+    stat_ellipse(aes(group = category2, color = category2)) +
+    ggtitle("PCoA (Bray-Curtis, SGB): top taxa overlay") +
+    labs(color = "Category") +
+    scale_color_manual(values = unlist(color_codes$category2), labels = color_codes$label_mapping)
+    plot(pcoa_taxa_plot)
+  ggsave("../figures/pcoa_bray_sgb_top_taxa.svg", plot = pcoa_taxa_plot, height = 6, width = 8)
+}
+```
+```{r}
+# load  cor_results
+
+cor_results <- read.csv("../data/processed/pcoa_taxa_correlations_spearman_hellinger.csv")
+
+
+```
+
+```{r}
+
+cor_results[cor_results$Padj_Axis1<0.05,] |> arrange(desc(abs(Cor_Axis1))) |> head(50) |> left_join(tax_tibble(pcoa_ps), by = c("Taxa"="FeatureID")) |> select(Taxa,Phylum, Species,Cor_Axis1,Cor_Axis2)
+
+
+
+
+```
+```{r}
+
+tax_of_interest="t__SGB4837" # "g__Blautia" #"t__SGB4820" #"t__SGB4837"
+
+plot_data <- pcoa_ps %>%
+  #tax_agg(rank = "Genus") %>%
+  tax_transform("log2", zero_replace = "halfmin", chain = TRUE) %>%
+  ps_get() %>%
+  ps_otu2samdat(tax_of_interest) %>% # adds tax as sample data!
+  samdat_tbl()
+
+ggplot(plot_data, aes(x = category2, y = .data[[tax_of_interest]],color=category2)) +
+  geom_boxplot(width = 0.5) +
+  #geom_jitter(width = 0.2, alpha = 0.5) +
+  scale_color_manual(values = unlist(color_codes$category2), labels = color_codes$label_mapping)+
+  labs(y="Log2 abundace", title=tax_table(pcoa_ps)[tax_of_interest,"Species"])+
+  theme_bw(base_family = "DejaVu Sans")
+
+ggsave("../figures/abundance_boxplot_"+tax_of_interest+".svg", height = 6, width = 6)
+
+```
+
+```{r}
+
+cor_results[cor_results$Padj_Axis2<0.05,] |> arrange(desc(abs(Cor_Axis2))) |> head(50) |> left_join(tax_tibble(pcoa_ps), by = c("Taxa"="FeatureID")) |> select(Phylum, Species,Cor_Axis1,Cor_Axis2)
+
+
+
+
+```
+
+### PCoA Jaccard (presence absence based)
+
+
+
+```{r}
+
+jaccard_ps <- ps_percent_filt %>%
+    tax_transform("identity", rank = "SGB") %>%
+    dist_calc("jaccard") %>%
+    ord_calc(method = "PCoA")
+
+
+```
+
+```{r}
+jaccard_plot <- ord_plot(jaccard_ps, color = "category2", size = 2) +
+    stat_ellipse(aes(group = category2, color = category2)) +
+    ggtitle("PCoA (Jaccard, SGB)") +
+    labs(color = "Category") +
+    scale_color_manual(values = unlist(color_codes$category2), labels = color_codes$label_mapping)
+
+plot(jaccard_plot)
+ggsave("../figures/pcoa_jaccard_sgb.svg", plot = jaccard_plot, height = 6, width = 8)
+```
+
+
+
+
+
+

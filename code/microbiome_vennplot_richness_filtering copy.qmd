@@ -1,0 +1,129 @@
+# Richness Filtering based on prevalence {#sec-richness-filtering}
+
+## Dependencies
+
+`utils.R` **-script**
+
+```{r}
+source("utils.R")
+```
+
+**Packages**
+
+```{r}
+#| echo: true
+#| message: false
+#| warning: false
+#| results: hide
+
+
+#devtools::install_github("gmteunisse/fantaxtic")
+#devtools::install_github("gmteunisse/ggnested")
+library(tidyverse)
+library(BiocManager)
+library(phyloseq)
+library(ggnested)
+library(vegan)
+library(matrixStats) #for 'colAnys'-function in'filter_species_by_group_prevalence'-function
+```
+
+## Data: Loading and Filtering
+
+-   metaphlan estimated count data table
+
+```{r}
+# metaphlan raw read data (MF_SGB_abundance.txt)
+metaphlanData <- read.table("../data/raw/MF_SGB_abundance.txt", header = TRUE, sep = "")
+metaphlanData$clade_name <- as.character(metaphlanData$clade_name)
+metaData <- read.table("../metadata/metadata_samples.csv", header = TRUE, sep = ",")
+
+# name the rows according to the sample names
+rownames(metaData) <- metaData$Sample_name
+
+# assigns 0 to all NA's in my metaphlan data table
+metaphlanData[is.na(metaphlanData)] <- 0
+
+```
+
+-   filtering of all duplicated samples (ppB, HpB, H1B)
+
+```{r}
+# metaphlanData
+metaphlanData <- metaphlanData[, !grepl("ppB|H1B|HpB", colnames(metaphlanData))]
+
+```
+
+## Phyloseq-Object
+
+```{r}
+meta_physeq <- metaphlan_to_phyloseq(metaphlanData, metaData, version = 4, verbose = TRUE, tax_lvl = "SGB")
+
+ps <- meta_physeq
+ps <- subset_taxa(ps, Kingdom !="UNKNOWN") # remove the unknowns
+
+#View(ps@tax_table@.Data)
+
+ps@tax_table@.Data <- substring(ps@tax_table@.Data, 4)
+taxa_names(ps) <- substring(taxa_names(ps), 4)
+colnames(ps@tax_table@.Data)<- c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species", "SGB")
+```
+
+### Filter Phyloseq-Object based on different Cut-OFFs
+
+prevalence cut offs of: 0, 5 and 10% Prevalence per Group
+
+```{r}
+# definition of minimal prevalence thresholds
+min_prevalence_values <- c(0, 0.05, 0.1)
+
+# list of filtered ps-objects
+list_filtered_ps <- list()
+
+# for-loop to filter based on min_prevalence_values
+
+for (min_prev in min_prevalence_values){
+  
+  # Apply the filtering function
+  ps_filtered <- filter_species_by_group_prevalence(
+    ps = ps,
+    min_count = 10,
+    min_prevalence = min_prev,
+    group_var = "animal"
+  )
+  
+  # Store the result in a named list
+  list_filtered_ps[[as.character(min_prev)]] <- ps_filtered
+}
+
+
+```
+
+## Richness Plots based on different Cut-OFFs
+
+```{r}
+#| label: richness_plots_by_prevalence
+
+# create an empty list for richness plots
+richness_plots <- list()
+
+# loop through each prevalence entery in list_filtered_ps
+i <- 1
+
+for (name in names(list_filtered_ps)){
+  # assign the namne of list_filtered_ps to the variable ps_obj
+  ps_obj <- list_filtered_ps[[name]]
+  
+  # plots
+  richness_plots[[i]] <- plot_richness(ps_obj, x = "animal", color = "animal")+
+  theme_minimal()+
+  geom_boxplot()+
+  labs(title = paste0("richnessplots: ", min_prev,"% prevalence per group"))+
+  ggtitle(paste("Prevalence filter: ", name, "% per group"))
+  
+  i = i + 1
+}
+
+# Display all 3 plots next to each other
+gridExtra::grid.arrange(grobs = richness_plots, nrow = 3)
+
+```

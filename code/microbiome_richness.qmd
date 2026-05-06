@@ -1,0 +1,702 @@
+# Richness {#sec-richness}
+
+## Dependencies
+
+`utils.R` **-script**
+
+```{r}
+source("utils.R")
+```
+
+**Packages**
+
+```{r}
+#| echo: true
+#| message: false
+#| warning: false
+#| results: hide
+
+
+#devtools::install_github("gmteunisse/fantaxtic")
+#devtools::install_github("gmteunisse/ggnested")
+library(tidyverse)
+library(BiocManager)
+library(phyloseq)
+library(ggnested)
+library(vegan)
+library(matrixStats)
+
+
+
+# load theme
+theme_publication <- function(base_size = 18, base_family = "DejaVu Sans") {
+ggplot2::theme_bw(
+base_size = base_size,
+base_family = base_family
+) +
+ggplot2::theme(
+plot.title = ggplot2::element_text(hjust = 0.5),
+axis.title = ggplot2::element_text(size = ggplot2::rel(1.05)),
+axis.text = ggplot2::element_text(size = ggplot2::rel(1.2)),
+legend.title = ggplot2::element_text(size = ggplot2::rel(0.95)),
+legend.text = ggplot2::element_text(size = ggplot2::rel(0.9)),
+strip.text = ggplot2::element_text(size = ggplot2::rel(0.95))
+)
+}
+```
+
+## Data: Loading and Filtering
+
+-   MetaPhlAn-Output estimated count data table
+
+```{r}
+# metaphlan raw read data (MF_SGB_abundance.txt)
+metaphlanData <- read.table("../data/raw/MF_SGB_abundance.txt", header = TRUE, sep = "")
+metaphlanData$clade_name <- as.character(metaphlanData$clade_name)
+metaData <- read.table("../../metadata/metadata_silas.csv", header = TRUE, sep = ",") %>%
+  column_to_rownames(var = "id")
+
+# name the rows according to the sample names
+rownames(metaData) <- metaData$Sample_name
+
+# assigns 0 to all NA's in my metaphlan data table
+metaphlanData[is.na(metaphlanData)] <- 0
+
+```
+
+-   filtering of all duplicated samples (ppB, HpB, H1B)
+
+```{r}
+# metaphlanData
+metaphlanData <- metaphlanData[, !grepl("ppB", colnames(metaphlanData))]
+
+```
+
+-   load colors
+
+```{r}
+# Load color codes from YAML file
+color_codes <- yaml::read_yaml("../../Metadata/color_codes.yaml")
+
+# Extract specific color palettes
+sample_type_colors <- unlist(color_codes$sample_types)
+pig_stage_colors <- unlist(color_codes$pig_stages)
+category2_colors <- unlist(color_codes$category2)
+```
+
+## Phyloseq-Object
+
+```{r}
+meta_physeq <- metaphlan_to_phyloseq(metaphlanData, metaData, version = 4, verbose = TRUE, tax_lvl = "SGB")
+
+ps <- meta_physeq
+ps <- subset_taxa(ps, Kingdom !="UNKNOWN") # remove the unknowns
+
+#View(ps@tax_table@.Data)
+
+ps@tax_table@.Data <- substring(ps@tax_table@.Data, 4)
+taxa_names(ps) <- substring(taxa_names(ps), 4)
+colnames(ps@tax_table@.Data)<- c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species", "SGB")
+```
+
+### Phyloseq-Object: Filtering
+
+```{r}
+ps_filtered <- filter_species_by_group_prevalence(
+  ps = ps,
+  min_count = 10,
+  min_prevalence = 0.1,
+  group_var = "category"
+)
+
+
+ps <-  ps_filtered
+```
+
+## Richness Plots Theme for 1x1 plots
+
+```{r}
+theme_personal <- function(){
+  list(
+    theme_bw(base_family = "DejaVu Sans") +
+    theme(
+      legend.position = "none",
+      plot.title = element_text(hjust = 0.5),
+      scale_x_discrete(labels = color_codes$label_mapping)
+    ),
+    scale_color_manual(values = sample_type_colors),
+    scale_x_discrete(labels = color_codes$label_mapping),
+    xlab("")
+  )
+}
+
+library(ggplot2)
+theme_set(theme_bw(base_family = "DejaVu Sans"))
+```
+
+## Richness plots by category
+
+```{r}
+richness_plots <- plot_richness(ps, x = "category", color = "category",
+              measures = c("Observed", "Shannon"))+
+  theme_bw(base_family = "DejaVu Sans")+
+  geom_boxplot()+
+  scale_color_manual(values = sample_type_colors)+
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x=element_blank(),
+    legend.position = "right"
+  )+
+  xlab("")+
+  ggtitle("Richness and Alpha Diversity by Group")+
+  scale_x_discrete(labels = color_codes$label_mapping)
+  
+
+print(richness_plots)
+
+ggsave("../figures/richness_plots.svg", height = 6, width = 8)
+
+
+
+```
+
+### Add Statistics
+
+```{r}
+alpha_richness_df <- estimate_richness(ps, measures =  c("Observed", "Shannon"))
+
+# add categorty
+alpha_richness_df$category <- sample_data(ps)$category
+
+# plot boxplots with statistics
+library(ggpubr)
+
+richness_plots + ggpubr::stat_compare_means(method = "wilcox.test")
+
+
+# define comparisons
+my_comparisons <- list(
+  c("Non_farmer_controls", "Pig_farmers"),
+  c("Non_farmer_controls", "Pigs"),
+  c("Pig_farmers", "Pigs")
+)
+
+
+richness_shannon_plot_groups <- richness_plots + ggpubr::stat_compare_means(method = "wilcox.test",
+                                            comparisons = my_comparisons,
+                                            aes(label = after_stat(p.format)),
+                                            label.y.npc = 0.95)
+
+
+print(richness_shannon_plot_groups)
+
+# save this plot
+ggsave("../figures/richness_shannon_groups.svg", plot = richness_shannon_plot_groups)
+```
+
+### One-panel plots
+
+#### Richness
+
+```{r}
+# Function to format p-values
+clean_p <- function(x) {
+  ifelse(
+    x < 0.001,
+    "<0.001",   
+    sprintf("%.3f", x)           # e.g. 0.155
+  )
+}
+
+# richness category
+p_richness_group <- plot_richness(ps, x = "category", color = "category",
+              measures = c("Observed"))+
+  geom_boxplot(
+    aes(fill = category),
+    color = "black"
+  )+
+  geom_jitter(
+    alpha = 0.3, width = 0.2, color = "black"
+  )+
+  facet_grid(. ~variable, labeller = as_labeller(c(Observed = "Richness per Group")))+
+  theme_personal()+
+  scale_fill_manual(values = sample_type_colors)
+
+
+p_richness_group_df <- estimate_richness(ps, measures =  c("Observed"))
+
+# add categorty
+p_richness_group_df$category <- sample_data(ps)$category
+
+# plot boxplots with statistics
+library(ggpubr)
+
+# define comparisons
+my_comparisons_groups <- list(
+  c("Non_farmer_controls", "Pig_farmers"),
+  c("Non_farmer_controls", "Pigs"),
+  c("Pig_farmers", "Pigs")
+)
+
+# Calculate p-values manually for each comparison
+pval_results <- list()
+for (i in 1:length(my_comparisons_groups)) {
+  group1 <- my_comparisons_groups[[i]][1]
+  group2 <- my_comparisons_groups[[i]][2]
+  
+  data1 <- p_richness_group_df$Observed[p_richness_group_df$category == group1]
+  data2 <- p_richness_group_df$Observed[p_richness_group_df$category == group2]
+  
+  test <- wilcox.test(data1, data2)
+  pval_results[[i]] <- data.frame(
+    group1 = group1,
+    group2 = group2,
+    p.value = test$p.value
+  )
+}
+
+pval_df_richness_group <- do.call(rbind, pval_results) %>%
+  mutate(
+    y.position = max(p_richness_group_df$Observed, na.rm = TRUE) * (1.05 + 0.10 * row_number()),
+    p.label = clean_p(p.value)
+  )
+
+p_richness_group <- p_richness_group + ggpubr::stat_pvalue_manual(
+    pval_df_richness_group,
+    label = "p.label",
+    xmin = "group1", xmax = "group2",
+    y.position = "y.position",
+    tip.length = 0.02,
+    size = 6,
+    family = "DejaVu Sans")+
+  theme(plot.margin = margin(5.5,5.5,5.5,5.5))+
+  ylab("Richness (species present per sample)")
+
+
+# adjust the size
+p_richness_group <- p_richness_group +
+  theme_publication()+
+  theme(
+    legend.position = "none",
+    strip.text = element_text(size = 15, face = "bold", family = "DejaVu Sans"),
+    strip.background = element_rect(fill = "grey85", color = "black"),
+    axis.text.x = element_text(size = 13)
+  )
+
+
+print(p_richness_group)
+
+ggsave("../figures/richness_1x1_group.svg", plot = p_richness_group)
+```
+
+#### Shannon
+
+```{r}
+p_shannon_group <- plot_richness(ps, x = "category", color = "category",
+              measures = c("Shannon"))+
+  geom_boxplot()+
+  facet_grid(. ~variable, labeller = as_labeller(c(Shannon = "Shannon Diversity Index per Group")))+
+  theme_personal()
+
+
+p_shannon_group_df <- estimate_richness(ps, measures =  c("Shannon"))
+
+# add categorty
+p_shannon_group_df$category <- sample_data(ps)$category
+
+# plot boxplots with statistics
+library(ggpubr)
+
+# define comparisons
+my_comparisons_groups <- list(
+  c("Non_farmer_controls", "Pig_farmers"),
+  c("Non_farmer_controls", "Pigs"),
+  c("Pig_farmers", "Pigs")
+)
+
+# Calculate p-values manually for each comparison
+pval_results_shannon <- list()
+for (i in 1:length(my_comparisons_groups)) {
+  group1 <- my_comparisons_groups[[i]][1]
+  group2 <- my_comparisons_groups[[i]][2]
+  
+  data1 <- p_shannon_group_df$Shannon[p_shannon_group_df$category == group1]
+  data2 <- p_shannon_group_df$Shannon[p_shannon_group_df$category == group2]
+  
+  test <- wilcox.test(data1, data2)
+  pval_results_shannon[[i]] <- data.frame(
+    group1 = group1,
+    group2 = group2,
+    p.value = test$p.value
+  )
+}
+
+pval_df_shannon_group <- do.call(rbind, pval_results_shannon) %>%
+  mutate(
+    y.position = max(p_shannon_group_df$Shannon, na.rm = TRUE) * (1 + 0.1 * row_number()),
+    p_label = clean_p(p.value)
+  )
+
+p_shannon_group <- p_shannon_group + ggpubr::stat_pvalue_manual(
+    pval_df_shannon_group,
+    label = "p_label",
+    xmin = "group1", xmax = "group2",
+    y.position = "y.position",
+    tip.length = 0.02,
+    size = 6,
+    family = "DejaVu Sans")+
+  theme(plot.margin = margin(5.5,5.5,5.5,5.5))+
+  ylab("Shannon Diversity Index")+
+  theme(
+    strip.text = element_text(size = 14, face = "bold", family = "DejaVu Sans"),
+    strip.background = element_rect(fill = "grey85", color = "black"),
+    axis.text.x = element_text(size = 13)
+  )+
+  theme_publication()+
+  theme(
+    legend.position = "none"
+  )
+
+
+print(p_shannon_group)
+
+ggsave("../figures/shannon_1x1_group.svg", plot = p_shannon_group)
+```
+
+## Richness plots by stage
+
+```{r}
+# plot boxplots with statistics
+library(ggpubr)
+
+# suset pigs from phyloseq object 
+ps_pigs <- subset_samples(ps, species == "Pig")
+
+# extract richness measures
+alpha_richness_stage_df <- estimate_richness(ps_pigs, measures =  c("Observed", "Shannon"))
+
+# add grwoth_stage
+alpha_richness_stage_df$grwoth_stage <- sample_data(ps_pigs)$growth_stage
+
+# define order (level)
+alpha_richness_stage_df$grwoth_stage <- factor(alpha_richness_stage_df$grwoth_stage,
+                                               levels = c("Suckling", "Weaning", "Fattening"))
+
+# define order (level) in the phyloseq object
+sample_data(ps_pigs)$growth_stage <- factor(
+  sample_data(ps_pigs)$growth_stage, levels = c("Suckling", "Weaning", "Fattening"))
+
+
+
+# define comparisons
+my_comparisons_stage <- list(
+  c("Fattening", "Suckling"),
+  c("Fattening", "Weaning"),
+  c("Suckling", "Weaning")
+)
+
+
+richness_plots_stage <- plot_richness(ps_pigs, x = "growth_stage", color = "growth_stage",
+              measures = c("Observed"))+
+  theme_bw(base_family = "DejaVu Sans")+
+  geom_boxplot()+
+  scale_color_manual(values = pig_stage_colors)+
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x=element_blank(),
+    legend.position = "right"
+  )+
+  xlab("")+
+  ggtitle("Richness by Growth Stage")+
+  scale_x_discrete(labels = color_codes$label_mapping)
+
+# Calculate p-values manually for richness stage plot
+pval_results_stage_richness_multi <- list()
+ps_pigs_richness <- estimate_richness(ps_pigs, measures = c("Observed"))
+ps_pigs_richness$growth_stage <- sample_data(ps_pigs)$growth_stage
+
+for (i in 1:length(my_comparisons_stage)) {
+  group1 <- my_comparisons_stage[[i]][1]
+  group2 <- my_comparisons_stage[[i]][2]
+  
+  data1 <- ps_pigs_richness$Observed[ps_pigs_richness$growth_stage == group1]
+  data2 <- ps_pigs_richness$Observed[ps_pigs_richness$growth_stage == group2]
+  
+  test <- wilcox.test(data1, data2)
+  pval_results_stage_richness_multi[[i]] <- data.frame(
+    group1 = group1,
+    group2 = group2,
+    p.value = test$p.value
+  )
+}
+
+pval_df_stage_richness_multi <- do.call(rbind, pval_results_stage_richness_multi) %>%
+  mutate(
+    y.position = max(ps_pigs_richness$Observed, na.rm = TRUE) * (1 + 0.1 * row_number()),
+    p_label = clean_p(p.value)
+  )
+
+richness_plots_stage <- richness_plots_stage + ggpubr::stat_pvalue_manual(
+    pval_df_stage_richness_multi,
+    label = "p_label",
+    xmin = "group1", xmax = "group2",
+    y.position = "y.position",
+    tip.length = 0.02,
+    size = 5,
+    family = "DejaVu Sans")
+
+print(richness_plots_stage)
+
+ggsave("../figures/richness_stage.svg", plot = richness_plots_stage)
+```
+
+### One-panel plots
+
+#### Richness
+
+```{r}
+p_richness_stage <- plot_richness(ps_pigs, x = "growth_stage", color = "growth_stage",
+              measures = c("Observed"))+
+  geom_boxplot(aes(
+    fill = growth_stage),
+    color = "black",
+    outlier.shape = NA)+
+  geom_jitter(
+    alpha = 0.3, width = 0.2
+  )+
+  facet_grid(. ~variable, labeller = as_labeller(c(Observed = "Richness per Pig Growth Stage")))+
+  theme_personal()+
+  scale_fill_manual(values = pig_stage_colors)
+  
+
+
+p_richness_stage_df <- estimate_richness(ps_pigs, measures =  c("Observed"))
+
+# add growth stage
+p_richness_stage_df$growth_stage <- sample_data(ps_pigs)$growth_stage
+
+# plot boxplots with statistics
+library(ggpubr)
+
+# Calculate p-values manually for each comparison
+pval_results_stage_richness <- list()
+for (i in 1:length(my_comparisons_stage)) {
+  group1 <- my_comparisons_stage[[i]][1]
+  group2 <- my_comparisons_stage[[i]][2]
+  
+  data1 <- p_richness_stage_df$Observed[p_richness_stage_df$growth_stage == group1]
+  data2 <- p_richness_stage_df$Observed[p_richness_stage_df$growth_stage == group2]
+  
+  test <- wilcox.test(data1, data2)
+  pval_results_stage_richness[[i]] <- data.frame(
+    group1 = group1,
+    group2 = group2,
+    p.value = test$p.value
+  )
+}
+
+pval_df_richness_stage <- do.call(rbind, pval_results_stage_richness) %>%
+  mutate(
+    y.position = max(p_richness_stage_df$Observed, na.rm = TRUE) * (1.05 + 0.10 * row_number()),
+    p.label = clean_p(p.value)
+  )
+
+p_richness_stage <- p_richness_stage + ggpubr::stat_pvalue_manual(
+    pval_df_richness_stage,
+    label = "p.label",
+    xmin = "group1", xmax = "group2",
+    y.position = "y.position",
+    tip.length = 0.02,
+    size = 6,
+    family = "DejaVu Sans")+
+  theme(
+      axis.title.y = element_blank(),
+      axis.text.y  = element_blank(),
+      axis.ticks.y = element_blank(),
+      plot.margin  = margin(5.5, 5.5, 5.5, 0)   # no left margin
+    )
+
+# make the header bigger
+p_richness_stage <- p_richness_stage +
+  theme_publication()+
+  theme(
+    strip.text = element_text(size = 15, face = "bold", family = "DejaVu Sans"),
+    strip.background = element_rect(fill = "grey85", color = "black"),
+    axis.text.x = element_text(size = 13),
+    legend.position = "none"
+  )
+
+print(p_richness_stage)
+
+# save the plot
+ggsave("../figures/richness_1x1_stage.svg", plot = p_richness_stage)
+```
+
+#### Shannon
+
+```{r}
+p_shannon_stage <- plot_richness(ps_pigs, x = "growth_stage", color = "growth_stage",
+              measures = c("Shannon"))+
+  geom_boxplot()+
+  facet_grid(. ~variable, labeller = as_labeller(c(Shannon = "Shannon Diversity Index per Pig Growth Stage")))+
+  theme_personal()+
+  scale_color_manual(values = pig_stage_colors)
+  
+
+
+p_shannon_stage_df <- estimate_richness(ps_pigs, measures =  c("Shannon"))
+
+# add growth stage
+p_shannon_stage_df$growth_stage <- sample_data(ps_pigs)$growth_stage
+
+# plot boxplots with statistics
+library(ggpubr)
+
+# Calculate p-values manually for each comparison
+pval_results_stage_shannon <- list()
+for (i in 1:length(my_comparisons_stage)) {
+  group1 <- my_comparisons_stage[[i]][1]
+  group2 <- my_comparisons_stage[[i]][2]
+  
+  data1 <- p_shannon_stage_df$Shannon[p_shannon_stage_df$growth_stage == group1]
+  data2 <- p_shannon_stage_df$Shannon[p_shannon_stage_df$growth_stage == group2]
+  
+  test <- wilcox.test(data1, data2)
+  pval_results_stage_shannon[[i]] <- data.frame(
+    group1 = group1,
+    group2 = group2,
+    p.value = test$p.value
+  )
+}
+
+pval_df_shannon_stage <- do.call(rbind, pval_results_stage_shannon) %>%
+  mutate(
+    y.position = max(p_shannon_stage_df$Shannon, na.rm = TRUE) * (1 + 0.1 * row_number()),
+    p_label = clean_p(p.value)
+  )
+
+p_shannon_stage <- p_shannon_stage + ggpubr::stat_pvalue_manual(
+    pval_df_shannon_stage,
+    label = "p_label",
+    xmin = "group1", xmax = "group2",
+    y.position = "y.position",
+    tip.length = 0.02,
+    size = 6,
+    family = "DejaVu Sans")+
+  theme(
+      axis.title.y = element_blank(),
+      axis.text.y  = element_blank(),
+      axis.ticks.y = element_blank(),
+      plot.margin  = margin(5.5, 5.5, 5.5, 0)   # no left margin
+    )+
+  ylab("Shannon Diversity Index")+
+  theme(
+    strip.text = element_text(size = 14, face = "bold", family = "DejaVu Sans"),
+    strip.background = element_rect(fill = "grey85", color = "black"),
+    axis.text.x = element_text(size = 13)
+  )
+
+
+
+print(p_shannon_stage)
+
+# save this plot
+ggsave("../figures/shannon_1x1_stage.svg", plot = p_shannon_stage)
+```
+
+## 4x4 Richness & Shannon plot
+
+```{r}
+library(patchwork)
+
+(richness_shannon_plot_groups | richness_plots_stage)+
+  plot_layout(guides = "collect") &
+  theme(legend.position = "bottom")
+```
+
+### Richness - 2x2
+
+```{r}
+
+# headroom for p-values
+y_max <- max(
+  p_richness_group$data$value,
+  p_richness_stage$data$value,
+  na.rm = TRUE
+)
+
+# keep enough headroom for all p-value brackets/labels in both panels
+y_top_stats <- max(
+  pval_df_richness_group$y.position,
+  pval_df_richness_stage$y.position,
+  na.rm = TRUE
+)
+ylims <- c(0, max(y_max * 1.15, y_top_stats * 1.05))
+
+
+# hide the y-axis on the right plot
+p_richness_stage_r <- p_richness_stage +
+  theme(
+    axis.title.y = element_blank(),
+    axis.text.y  = element_blank(),
+    axis.ticks.y = element_blank()
+  )
+
+# adjust size of y-axis of left plot
+p_richness_group <- p_richness_group +
+  theme(
+    axis.title.y = element_text(size = 18),  # y-label
+    axis.text.y  = element_text(size = 17)   # y-axis numbers
+  )
+
+# combine the plots
+library(patchwork)
+
+layout_richness <-
+  (p_richness_group | p_richness_stage_r) &
+  coord_cartesian(ylim = ylims)
+
+layout_richness
+
+ggsave("../figures/richness_final_2x2.svg", plot = layout_richness, width = 8, height = 6)
+```
+
+### Shannon - 2x2
+
+```{r}
+# layout shannon
+
+# common limits and grids
+common_limits_shannon <- range(
+  ggplot_build(p_shannon_group)$data[[1]]$y,
+  ggplot_build(p_shannon_stage)$data[[1]]$y
+)
+
+extra <- 1.1 * diff(common_limits_shannon)
+common_limits_shannon[1] <- common_limits_shannon[1] + extra
+
+p_shannon_group  <- p_shannon_group  + scale_y_continuous(limits = common_limits_shannon)
+p_shannon_stage  <- p_shannon_stage  + scale_y_continuous(limits = common_limits_shannon)
+
+
+layout_shannon <- (p_shannon_group | p_shannon_stage) +
+  plot_layout(
+    guides = "collect",
+    widths = c(1, 1),       
+    design = "AB"           
+  )
+
+layout_shannon
+
+ggsave("../figures/shannon_final_2x2.svg", plot = layout_shannon, width = 7, height = 6)
+```
+
+merge both together
+
+```{r}
+layout_final <- layout_richness / layout_shannon
+layout_final
+
+# save layout_final
+ggsave("../figures/richness_shannon_final_4x4_panel.svg", plot = layout_final, width = 7, height = 10, dpi = 600)
+```

@@ -1,0 +1,1178 @@
+---
+title: "strain_analysis_6"
+format: html
+---
+
+# Strain Analylsis 6
+
+**clean scripts for detecting shared strains from Permanova analysis (2 groups; pig - farmers) suckling pigs exluded, **mrpp** analysis **\
+
+## setup chunk
+
+```{r}
+#| include = FALSE
+
+
+my_theme <- function() {
+  theme_bw(base_family = "DejaVu Sans") +
+    theme(
+      plot.title = element_text(hjust = 0.5),
+    )
+}
+
+library(ggplot2)
+theme_set(my_theme())
+
+
+
+```
+
+## dependencies
+
+```{r}
+library(tidyverse)
+library(utils)
+library(archive)
+library(R.utils) # to define and work with paths
+library(purrr)
+library(vegan) # betadispr
+library(dplyr)
+library(stringr)
+library(tidyr) # for separate function
+library(readr) # for reading and writing .csv-files
+library(svglite) # to save plots as svg)
+
+# fonts
+
+library(systemfonts)
+subset(system_fonts(), family == "DejaVu Sans")
+
+```
+
+**define file pathways**
+
+```{r}
+# define paths
+dir_path <- "../data/raw/GD"
+out_path <- "../data/processed/GD"
+```
+
+## load metadata
+
+```{r}
+metaData <- read.table("../../Metadata/metadata_silas.csv", header = TRUE, sep = ",") %>%
+  column_to_rownames(var = "id")
+
+
+sgb_annotation <- read.table("../../Metadata/sgb_annotation.csv", header = T, sep = ",")
+```
+
+## extract all distance matrices
+
+```{r}
+
+# make sure that out_path exists
+if(!dir.exists(out_path)) dir.create(out_path)
+
+# extract all files into processed folder
+files_gz <- list.files(dir_path, pattern = "\\.tsv\\.gz$", full.names = TRUE)
+
+for (f in files_gz) {
+  out_file <- file.path(out_path, basename(sub("\\.gz$", "", f)))
+  R.utils::gunzip(f, destname = out_file, overwrite = TRUE)
+
+}
+
+# load metadata
+
+metaData <- read.table("../../metadata/metadata_silas.csv", header = TRUE, sep = ",") %>%
+  column_to_rownames(var = "id")
+```
+
+**list all files the processed directory**
+
+```{r}
+files_tsv <- list.files(out_path, pattern = "\\.tsv$", full.names = TRUE)
+print(length(files_tsv))
+```
+
+
+## mrpp-approach
+```{r}
+set.seed(123)
+library(dplyr)
+library(stringr)
+
+# MRPP workflow 
+res.mrpp_pig_worker <- map_dfr(files_tsv, function(f) {
+  
+  message("Processing file: ", f)
+
+  # Matrix prep 
+  m <- read.table(f, header = TRUE, sep = "\t")
+  rownames(m) <- m[,1]; m <- m[,-1]
+  m[] <- lapply(m, function(x) as.numeric(as.character(x))); m <- as.matrix(m)
+  if (nrow(m) != ncol(m)) stop("Non-square matrix")
+  colnames(m) <- rownames(m)
+  
+  # normalize the matrix
+  # m <- m / max(m, na.rm = TRUE)
+  
+  # Metadata: ppB/pigs+farmers only
+  metaData_clean <- metaData %>% rownames_to_column("id") %>%
+    mutate(sample_strip = str_remove(id, "^C"))
+  meta_sgb <- metaData_clean %>%
+    filter(sample_strip %in% rownames(m)) %>%
+    mutate(sample = sample_strip) %>%
+    select(sample, farm, species, category, everything()) %>%
+    filter(!str_detect(sample, "ppB")) %>%
+    filter(category != "Non_farmer_controls") %>%
+    mutate(Host = category) %>%  # Pigs vs Pig_farmers
+    droplevels()
+  
+  Host_counts <- table(meta_sgb$Host)
+  if (any(Host_counts < 5) || length(Host_counts) < 2) {
+    message("⚠️ Skipping: need >=5/group")
+    return(tibble(SGB = str_extract(basename(f), "SGB\\d+"), 
+                  A_stat = NA, p_value = NA))
+  }
+  
+  keep_samples <- intersect(meta_sgb$sample, rownames(m))
+  m_sub <- m[keep_samples, keep_samples, drop = FALSE]
+  meta <- meta_sgb[match(keep_samples, meta_sgb$sample), , drop = FALSE]
+  meta$Host <- as.factor(meta$Host)
+  dist_matrix <- as.dist(m_sub)
+  
+  # MRPP 
+  mrpp_result <- mrpp(dist_matrix, grouping = meta$Host, permutations = 999)
+  
+  # Extract stats
+  A_stat <- mrpp_result[["A"]]  # Chance-corrected within-group agreement
+  p_value <- mrpp_result[["Pvalue"]]  # Permutation p-value
+  
+  n_sample_pigs <- sum(meta$Host == "Pigs")
+  n_sample_farmers <- sum(meta$Host == "Pig_farmers")
+  
+  
+  sgb <- str_extract(basename(f), "SGB\\d+")
+  tibble(SGB = sgb, 
+         A_stat = A_stat,      # >0 = stronger within-group (host-specific)
+         p_value = p_value,    # <0.05 = sig within-group structure
+         n_sample_pigs = n_sample_pigs,
+         n_sample_farmers = n_sample_farmers)
+})
+
+# Interpretation
+host_specific <- res.mrpp_pig_worker %>% 
+  filter(A_stat > 0 & p_value < 0.05)  # Host-specific strains
+
+shared_strains <- res.mrpp_pig_worker %>% 
+  filter(A_stat <= 0 | p_value >= 0.05)  # Shared/no structure
+
+```
+#### barplot
+```{r}
+head(res.mrpp_pig_worker)
+
+df_barplot_mrpp <- data.frame(
+  host_specific = sum(res.mrpp_pig_worker$p_value < 0.05, na.rm= TRUE),
+  non_host_specific = sum(res.mrpp_pig_worker$p_value >= 0.05,  na.rm = T),
+  amount_NA = sum(is.na(res.mrpp_pig_worker$p_value))
+  )%>%
+  pivot_longer(cols = everything(),
+               names_to = "variable",
+               values_to = "count")
+
+head(df_barplot_mrpp)
+
+  barplot_mrpp <- ggplot(data = df_barplot_mrpp, aes(x = variable, y = count))+
+  geom_bar(stat ="identity", width = 0.45, color = "black", fill = "lightblue")+
+  theme_bw()+
+  xlab("")+
+  geom_text(
+    aes(label = paste0("n = ",count)),
+    vjust = 1.5,
+    size = 5
+  )+
+    theme_publication()+
+    theme(axis.text.x = element_text(angle = 25, hjust = 1, vjust = 1))+
+    ggtitle("MRPP-Appraoch, SGB classification")
+
+
+barplot_mrpp
+
+# save:
+ggsave("../figures/mrpp_n_sgb.svg", plot = barplot_mrpp, width = 6, height = 6, web_fonts = "DejaVu Sans")
+```
+
+
+## Individualization
+
+### individualized with normalized distances
+
+-   normalization by median of the matrix
+
+-   calculation of all minimal distances to a next sample
+
+-   plot the median of all SGBs to the nearest next strain
+
+-   check distribution
+
+```{r}
+results_min_normalized <- map_dfr(files_tsv, function(f) {
+# show which sample is processed
+  message("Processing file: ", f)
+  
+  # extract and manipulate matrix
+  m <- read.table(f, header = TRUE, sep = "\t")
+  rownames(m) <- m[,1]
+  # remove sample name column
+  m <- m[,-1]
+  
+  # ensure numeric
+  m[] <- lapply(m, function(x) as.numeric(as.character(x)))
+  m <- as.matrix(m)
+  
+  # normalize matrix by maximal branch length
+  m <- m/median(m, na.rm = TRUE) 
+  
+   # metadata: extract sample names
+  metadata <- data.frame(
+    sample = rownames(m)
+  )
+
+  # set row names the same as sample name
+  row.names(metadata) <- metadata$sample
+  
+  
+  # metadata: assign the group
+  metadata <- metadata %>%
+    mutate(group = if_else(str_detect(sample, "pp"), "pig",
+                           if_else(str_detect(sample, "H"), "worker", "ctrl"))) %>%
+    mutate(group_2 = if_else(str_detect(group, "pig"), "pig", "human"),
+           is_ppB = str_detect(sample, "ppB"))%>%
+    filter(!is_ppB)
+  
+  # turn group into factor
+  metadata$group <- as.factor(metadata$group)
+  metadata$group_2 <- as.factor(metadata$group_2)
+  
+  
+  # filter: keep only groups with >=5 samples
+  keep_groups <- names(which(table(metadata$group_2) >= 5))
+  metadata <- droplevels(metadata[metadata$group_2 %in% keep_groups, , drop = FALSE])
+  
+  # subset the matrix based on keep_groups 
+  if (nlevels(metadata$group_2) < 2) {
+    message("Skipping ", f, " (not enough pig/human samples)")
+    return(tibble(
+      SGB = str_extract(basename(f), "SGB\\d+"),
+      median_min = NA_real_
+    ))
+  }
+  
+  keep_samples <- rownames(metadata)
+  
+  keep_samples <- intersect(keep_samples, rownames(m))
+  keep_samples <- intersect(keep_samples, colnames(m))
+  
+  if (length(keep_samples) < 2) {
+    message("Skipping ", f, " (less than 2 samples after matching)")
+    return(tibble(
+      SGB = str_extract(basename(f), "SGB\\d+"),
+      median_min = NA_real_
+    ))
+  }
+  
+   # final safety check (prevents subscript out of bounds)
+  if (!all(keep_samples %in% rownames(m)) ||
+      !all(keep_samples %in% colnames(m))) {
+    message("Skipping ", f, " (mismatch between metadata and matrix names)")
+    return(tibble(
+      SGB      = str_extract(basename(f), "SGB\\d+"),
+      median_min = NA_real_
+    ))
+  }
+
+  
+  m_sub <- m[keep_samples, keep_samples, drop = F]
+  
+  # remove diagonal, to ignore self
+  diag(m_sub) <- NA
+  min_per_sample <- apply(m_sub,1,min,na.rm = T)
+  tibble(
+      SGB = str_extract(basename(f), "SGB\\d+"),
+      median_min = median(min_per_sample, na.rm = T)
+    )
+  
+})
+```
+
+display density and save
+
+```{r}
+head(results_min_normalized)
+
+density_min_SGB_normalized <- ggplot(data = results_min_normalized, aes(x = median_min))+
+  geom_density()+
+  labs(
+    subtitle = "median distance to nearest other strain based on normalized distances" 
+  )
+print(density_min_SGB_normalized)
+
+# ggsave
+ggsave("../figures/median_minimal_SGB_distance.svg",
+       plot = density_min_SGB_normalized,
+       width = 6, 
+       height = 6,
+       device = svglite,
+       web_fonts = "DejaVu Sans")
+```
+
+### pick a threshold
+
+```{r}
+quantile(results_min_normalized$median_min, probs = c(0.25,0.5, 0.75, 0.9, 0.95), na.rm = TRUE)
+
+t <- median(results_min_normalized$median_min, na.rm = T)
+
+t
+```
+
+classify the results in individualized vs. non_individualized
+
+```{r}
+results_min_classified <- results_min_normalized %>%
+  mutate(individualized = median_min > t)
+
+# check counts
+table(results_min_classified$individualized, useNA = "ifany")
+```
+
+ggplot to see separation
+
+```{r}
+ggplot(results_min_classified, aes(x = median_min, fill = individualized)) +
+  geom_density(alpha = 0.4) +
+  geom_vline(xintercept = t, linetype = "dashed") +
+  theme_bw() +
+  labs(x = "median_min", title = "Mean nearest-neighbor nGD per SGB")
+
+```
+
+
+**take SGBs for inspection make four groups**
+
+```{r}
+
+res_4cat_mrpp <- results_min_classified %>%
+  left_join(res.mrpp_pig_worker, by = "SGB") %>%
+  mutate(
+    host_specific = p_value < 0.05,
+    category = case_when(
+      host_specific &  individualized ~ "host_specific + individualized",
+      host_specific & !individualized ~ "host_specific + non_individualized",
+     !host_specific &  individualized ~ "non_host_specific + individualized",
+     !host_specific & !individualized ~ "non_host_specific + non_individualized"
+    )
+  )
+
+```
+
+summary the amount per groups
+
+```{r}
+summary_res_4cat_mrpp <- dplyr::count(
+  res_4cat_mrpp,
+  category,
+  name = "n"
+) %>%
+  filter(!is.na(category)) %>%
+  mutate(
+    category = factor(
+      category,
+      levels = c(
+        "host_specific + individualized",
+        "host_specific + non_individualized",
+        "non_host_specific + individualized",
+        "non_host_specific + non_individualized"
+      )
+    )
+  ) %>%
+  arrange(category) %>%
+  mutate(pct = round(100 * n / sum(n), 1))
+
+summary_res_4cat_mrpp
+
+
+```
+
+### Host type effect vs. individualization (boxplots)
+
+```{r}
+res_4cat_mrpp <- res_4cat_mrpp %>%
+  filter(!is.na(category))
+
+
+boxplots_perm_ind <- ggplot(res_4cat_mrpp, aes(x = category, y = A_stat, fill = category)) +
+  geom_boxplot(outlier.alpha = 0.3) +
+  geom_jitter(alpha = 0.5, width = 0.1)+
+  my_theme() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none") +
+  ylab("MRPP A statistics (human vs pig)") +
+  xlab("") +
+  labs(title = "Host-type effect versus individualization")+
+  scale_fill_manual(
+    values=c("#1b85b8", "#5a5255", "#559e83", "#ae5a41"))+
+  theme_publication()+
+  theme(
+    legend.position ="none",
+    axis.text.x = element_text(angle = 37, hjust =1, size = 10)
+  )
+
+boxplots_perm_ind
+
+# ggsave
+ggsave("../figures/boxplot_mrpp_individualization.svg",
+       plot = boxplots_perm_ind,
+       width = 7,
+       height = 6,
+       device = svglite,
+       web_fonts = "DejaVu Sans")
+```
+
+### R2 vs. mean min plot
+
+```{r}
+# remove NA
+res_4cat_clean <- res_4cat_mrpp %>%
+  na.omit()
+
+# summary table
+res_4cat_clean_summary <- res_4cat_clean %>%
+  group_by(category)%>%
+  summarise(
+    n = n(),
+    .groups = "drop"
+  )
+
+res_4cat_clean_summary
+
+# labels vec
+labels_vec <- with(res_4cat_clean_summary, setNames(
+  paste0(category, " (n = ", n, ")"),
+  category))
+
+labels_vec 
+
+
+#  scatterplot
+scatter_perm_ind <- ggplot(data = res_4cat_clean, aes(x = median_min, y = A_stat, color = category))+
+  geom_point()+
+  labs(
+    #title = "Scatterplot by Category"
+  )+
+  scale_color_manual(
+    values=c("#1b85b8", "#5a5255", "#559e83", "#ae5a41"),
+    labels = labels_vec)+
+  geom_vline(xintercept = t, col = "red", linetype = "dashed")+
+    ylab("MRPP A statistics")+
+    xlab("minimal neighbour distribution")+
+  theme_publication()+
+  theme(
+    legend.title = element_blank(),
+    legend.position = c(0.73, 0.91),        # top-right inside plot
+    legend.background = element_rect(fill = alpha("white", 0.7), color = NA)
+  )
+  
+
+scatter_perm_ind
+
+
+```
+
+```{r}
+# ggsave
+ggsave("../figures/scatterplot_mrpp_individualization.svg",
+       plot = scatter_perm_ind,
+       width = 10,
+       height = 8,
+       device = svglite,
+       web_fonts = "DejaVu Sans")
+```
+
+## SGB Annotation
+
+```{r}
+df_annot <- res_4cat_clean %>%
+  left_join(.,sgb_annotation, by = "SGB")
+
+#check dataframe
+amount_nonsig <- sum(res_4cat_clean$host_specific == F)
+amount_nonsig
+
+write.csv(df_annot, file = "../data/processed/sub-species_analysis_annot.csv", row.names = F)
+
+```
+
+### 4 categories (host specificity and individualization)
+
+#### Phylum-Level
+
+```{r}
+df_phylum <- df_annot %>%
+  group_by(category, Phylum) %>%
+  summarise(
+    n = n(),
+    .groups = "drop"
+  )
+
+
+barplot_phylum <- ggplot(data = df_phylum, aes(x = Phylum, y = n, fill = category))+
+  geom_col(position = "dodge", stat = "identity")+
+  geom_text(
+    aes(label = n),
+    position = position_dodge(width = 0.9),
+    vjust = -0.4,
+    size = 5
+  )+
+  my_theme()+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))+
+  scale_fill_manual(values=c("#1b85b8", "#5a5255", "#559e83", "#ae5a41", "grey"))+
+  theme_publication()+
+  theme(
+    legend.title = element_blank(),
+    legend.position = c(0.78, 0.85),        # top-right inside plot
+    legend.background = element_rect(fill = alpha("white", 0.7), color = NA),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )+
+  xlab("")
+
+print(barplot_phylum)
+
+#save
+ggsave("../figures/4quadrant_mrpp_phylum.svg", plot = barplot_phylum, 
+       width = 10,
+       height = 8,
+       device = svglite,
+       web_fonts = "DejaVu Sans") 
+```
+
+#### Family-Level
+
+```{r}
+df_family <- df_annot %>%
+  group_by(category, Family) %>%
+  summarise(
+    n = n(),
+    .groups = "drop"
+  )%>%
+  filter(n>=2)
+
+
+barplot_family <- ggplot(data = df_family, aes(x = Family, y = n, fill = category))+
+  geom_col(position = "dodge", stat = "identity")+
+  my_theme()+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))+
+  scale_fill_manual(values=c("#1b85b8", "#5a5255", "#559e83", "#ae5a41", "grey"))
+
+print(barplot_family)
+```
+
+### 2 categories (host specificity)
+
+#### Phylum-Level
+
+```{r}
+df_phylum_hp <- df_annot %>%
+  group_by(host_specific, Phylum) %>%
+  summarise(
+    n = n(),
+    .groups = "drop"
+  )%>%
+  mutate(host_specific = if_else(host_specific == T, "host specific", "non-host specific"))
+
+
+barplot_phylum_hp <- ggplot(data = df_phylum_hp, aes(x = Phylum, y = n, fill = host_specific))+
+  geom_col(position = "dodge", stat = "identity")+
+  my_theme()+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))+
+  scale_fill_manual(values=c("#1b85b8", "#ae5a41"))
+
+print(barplot_phylum_hp)
+```
+
+#### Family_Level
+
+```{r}
+df_family_hp <- df_annot %>%
+  group_by(host_specific, Family) %>%
+  summarise(
+    n = n(),
+    .groups = "drop"
+  )%>%
+  mutate(host_specific = if_else(host_specific == T, "host specific", "non-host specific"))%>%
+  filter(n>=2)
+
+
+barplot_family_hp <- ggplot(data = df_family_hp, aes(x = Family, y = n, fill = host_specific))+
+  geom_col(position = "dodge", stat = "identity")+
+  my_theme()+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))+
+  scale_fill_manual(values=c("#1b85b8", "#ae5a41"))
+
+print(barplot_family_hp)
+```
+## export data to csv
+```{r}
+write.csv(df_annot, "../data/processed/strain_analysis_annotations_6.csv", row.names = F)
+```
+
+## mrpp on farm level
+
+
+## mrpp-approach: Within-farm pig similarity (comparing across farms)
+```{r}
+set.seed(123)
+
+res.mrpp_pigs_within_farm <- map_dfr(files_tsv, function(f) {
+  
+  message("Processing file: ", f)
+  sgb <- str_extract(basename(f), "SGB\\d+")
+
+  # Matrix prep 
+  m <- read.table(f, header = TRUE, sep = "\t")
+  rownames(m) <- m[,1]; m <- m[,-1]
+  m[] <- lapply(m, function(x) as.numeric(as.character(x))); m <- as.matrix(m)
+  if (nrow(m) != ncol(m)) stop("Non-square matrix")
+  colnames(m) <- rownames(m)
+  
+  # normalize the matrix
+  m <- m / max(m, na.rm = TRUE)
+  
+  # Metadata: pigs only, grouped by farm
+  metaData_clean <- metaData %>% rownames_to_column("id") %>%
+    mutate(sample_strip = str_remove(id, "^C"))
+  
+  meta_sgb <- metaData_clean %>%
+    filter(sample_strip %in% rownames(m)) %>%
+    mutate(sample = sample_strip) %>%
+    select(sample, farm, species, category, everything()) %>%
+    filter(!str_detect(sample, "ppB")) %>%
+    filter(category != "Non_farmer_controls") %>%
+    filter(category == "Pigs") %>%  # PIGS ONLY
+    droplevels()
+  
+  # Check: need >=2 pigs per farm
+    farm_counts <- table(meta_sgb$farm)
+    farms_with_2plus <- names(farm_counts[farm_counts >= 2])
+  
+    # Filter metadata to keep only farms with >=2 pigs
+    meta_sgb <- meta_sgb %>% filter(farm %in% farms_with_2plus)
+  
+    # Now check if we have >=2 farms remaining
+    if (nrow(meta_sgb) < 4 || length(unique(meta_sgb$farm)) < 2) {
+      message("⚠️ Skipping: need >=2 farms with >=2 pigs each (after filtering)")
+      return(tibble(SGB = sgb, A_stat = NA, p_value = NA, n_farms = NA))
+    }
+  
+  keep_samples <- intersect(meta_sgb$sample, rownames(m))
+  m_sub <- m[keep_samples, keep_samples, drop = FALSE]
+  meta <- meta_sgb[match(keep_samples, meta_sgb$sample), , drop = FALSE]
+  meta$farm <- as.factor(meta$farm)
+  
+  dist_matrix <- as.dist(m_sub)
+  
+  # Check for NaN/Inf/NA in distance matrix
+  if (any(!is.finite(as.matrix(dist_matrix)))) {
+    message("⚠️ Skipping: distance matrix contains non-finite values (NaN/Inf/NA)")
+    return(tibble(SGB = str_extract(basename(f), "SGB\\d+"), 
+                  A_stat = NA, p_value = NA, n_farms = NA))
+  }
+  
+  # MRPP: pigs grouped by farm
+  mrpp_result <- mrpp(dist_matrix, grouping = meta$farm, permutations = 999)
+  
+  # Extract stats
+  A_stat <- mrpp_result[["A"]]
+  p_value <- mrpp_result[["Pvalue"]]
+  n_farms <- nlevels(meta$farm)
+  
+  tibble(SGB = sgb, 
+         A_stat = A_stat,
+         p_value = p_value,
+         n_farms = n_farms)
+})
+
+# Significant within-farm pig clustering
+pigs_farm_structured <- res.mrpp_pigs_within_farm %>% 
+  filter(A_stat > 0 & p_value < 0.05)
+
+head(res.mrpp_pigs_within_farm)
+```
+### p-valueplot
+```{r}
+mrpp_farm_level <- res.mrpp_pigs_within_farm %>%
+  filter(!is.na(A_stat))%>%
+  mutate(farm_specific = if_else(p_value < 0.05 & A_stat > 0, TRUE, FALSE))%>%
+  rename(A_stat_farm_level = A_stat, p_value_farm_level = p_value)
+
+ggplot(data = mrpp_farm_level, aes(y = A_stat_farm_level, x = p_value_farm_level, col = farm_specific))+
+  geom_point(alpha = 0.5)
+```
+### barplot farm levle
+```{r}
+df_barplot_mrpp_farm <- data.frame(
+  farm_specific = sum(res.mrpp_pigs_within_farm$p_value < 0.05, na.rm= TRUE),
+  non_farm_specific = sum(res.mrpp_pigs_within_farm$p_value >= 0.05,  na.rm = T),
+  amount_NA = sum(is.na(res.mrpp_pigs_within_farm$p_value))
+  )%>%
+  pivot_longer(cols = everything(),
+               names_to = "variable",
+               values_to = "count")
+
+head(df_barplot_mrpp_farm)
+
+barplot_mrpp_farm <- ggplot(data = df_barplot_mrpp_farm, aes(x = variable, y = count))+
+geom_bar(stat ="identity", width = 0.3, color = "black", fill = "lightblue")+
+theme_bw()+
+xlab("")+
+geom_text(
+  aes(label = paste0("n = ",count)),
+  vjust = 1.5,
+  size = 3
+)+
+  theme_publication()+
+  labs(
+    title = "MRPP-Approach farm specificity"
+  )+
+  theme(
+    axis.text.x = element_text(angle = 25, vjust = 1, hjust = 1)
+  )
+
+barplot_mrpp_farm
+
+# ggsave
+ggsave("../figures/barplot_mrpp_farm.svg", plot = barplot_mrpp_farm, 
+       width = 6, height = 6, web_fonts = "DejaVu Sans")
+```
+
+## Questions for manuscript
+merge with mrpp-result
+```{r}
+df_annot_final <- df_annot %>%
+  left_join(mrpp_farm_level, by = "SGB")
+
+## GB classification checks
+
+# add derived flags used for the questions
+df_gb <- df_annot_final %>%
+  mutate(
+    host_ambivalent = !host_specific,
+    phylum_simple = if_else(is.na(Phylum) | Phylum == "", "Unknown", Phylum)
+  )
+```
+
+
+### Q1: Bacteroidota show more host-ambivalent strains
+```{r}
+df_bact_host <- df_gb %>%
+  filter(!is.na(host_ambivalent)) %>%
+  mutate(is_bacteroidota = phylum_simple == "Bacteroidota")
+
+tab_bact_host <- table(df_bact_host$is_bacteroidota, df_bact_host$host_ambivalent)
+fisher_bact_host <- tryCatch(fisher.test(tab_bact_host), error = function(e) NA)
+fisher_bact_host
+
+df_plot <- df_bact_host %>%
+  dplyr::count(is_bacteroidota, host_ambivalent, name = "n") %>%
+  group_by(is_bacteroidota) %>%
+  mutate(prop = n / sum(n)) %>%  # Proportions within each phylum
+  ungroup()
+
+plot_bact_host <- df_plot %>%
+  ggplot(aes(x = is_bacteroidota, y = prop, fill = host_ambivalent)) +
+  geom_col(position = "fill") +  # "fill" = 100% stacked
+  geom_text(aes(label = paste0("n=", n)), 
+            position = position_fill(vjust = 0.5), size = 3, 
+            color = "white", fontface = "bold") +  # n-labels on proportions
+  scale_x_discrete(labels = c(`TRUE` = "Bacteroidota", `FALSE` = "Other")) +
+  scale_y_continuous(labels = scales::percent_format()) +  # % y-axis
+  scale_fill_brewer(palette = "Set2", name = "Host-ambivalent") +
+  labs(
+    x = "Phylum", 
+    y = "Proportion", 
+    title = "Host Specificity Comparison: Bacteroidota vs Other",
+    subtitle = paste("Fisher's exact test p =", round(fisher_bact_host$p.value, 3))
+  ) +
+  my_theme() +
+  theme(legend.position = "bottom",
+        plot.title = element_text(size = 12, face = "bold"))
+
+print(plot_bact_host)
+ggsave("../figures/bact_host_specificity_stacked.svg", plot_bact_host, 
+       width = 8, height = 6, dpi = 300, web_fonts = "DeJaVu Sans")
+```
+
+### Q2: Bacteroidota are more farm-specific
+```{r}
+df_bact_farm <- df_gb %>%
+  filter(!is.na(farm_specific)) %>%
+  mutate(is_bacteroidota = phylum_simple == "Bacteroidota")
+
+#fisher
+tab_bact_farm <- table(df_bact_farm$is_bacteroidota, df_bact_farm$farm_specific)
+fisher_bact_farm <- tryCatch(fisher.test(tab_bact_farm), error = function(e) NA)
+fisher_bact_farm
+
+
+df_plot_farm <- df_bact_farm %>%
+  dplyr::count(is_bacteroidota, farm_specific, name = "n")%>%
+  group_by(is_bacteroidota)%>%
+  mutate(prop = n/sum(n)) %>%
+  ungroup()
+
+plot_bact_farm <- ggplot(data = df_plot_farm, aes(x = is_bacteroidota, y = prop, fill = farm_specific))+
+  geom_col(position = "fill")+
+  geom_text(aes(label = paste0("n= ", n)),
+            position = position_fill(vjust = 0.5), size = 3,
+            color = "black", fontface = "bold")+
+  scale_x_discrete(labels = c(`TRUE`= "Bacteriodota", `FALSE` = "Other"))+
+  scale_y_continuous(labels = scales::percent_format())+
+  scale_fill_brewer(palette = "Set3", name = "Farm-specific")+
+  labs(
+    y = "Proportion of SGBs",
+    x = "Phylum",
+    title ="Farm Specific Comparison: Bacteroidota vs. Other", 
+    subtitle = paste("Fisher's exact test p =", round(fisher_bact_farm$p.value,3))
+  )+
+  my_theme()+
+  theme(legend.position = "bottom",
+        plot.title = element_text(size = 12, face = "bold"))
+
+print(plot_bact_farm)
+
+# save this plot
+ggsave("../figures/bact_farm_specific_stacked.svg", plot_bact_farm,
+       width = 8, height = 6, dpi = 300, web_fonts = "DeJaVu Sans")
+```
+
+### Q2b: Farm specificity across phyla (absolute counts)
+```{r}
+# Absolute stacked barplots across multiple phyla
+df_farm_base <- df_gb %>%
+  filter(!is.na(farm_specific), !is.na(phylum_simple)) %>%
+  mutate(
+    farm_specific_label = if_else(farm_specific, "Farm-specific", "Non-farm-specific")
+  )
+
+# Keep top 4 phyla by total count; collapse remaining to "Others" (5 groups total)
+top4_phyla_farm <- df_farm_base %>%
+  dplyr::count(phylum_simple, name = "total_n") %>%
+  arrange(desc(total_n)) %>%
+  slice_head(n = 4) %>%
+  pull(phylum_simple)
+
+df_farm_phylum_abs <- df_farm_base %>%
+  mutate(
+    phylum_group = if_else(phylum_simple %in% top4_phyla_farm, phylum_simple, "Others")
+  ) %>%
+  dplyr::count(phylum_group, farm_specific_label, name = "n")
+
+# Keep order: top 4 by abundance, then Others
+phylum_order <- c(top4_phyla_farm, "Others")
+df_farm_phylum_abs <- df_farm_phylum_abs %>%
+  mutate(phylum_group = factor(phylum_group, levels = phylum_order))
+
+# Precompute label positions for outside labels with connector lines
+df_farm_phylum_abs <- df_farm_phylum_abs %>%
+  mutate(farm_specific_label = factor(farm_specific_label,
+                                      levels = c("Non-farm-specific", "Farm-specific")))
+
+label_df_farm <- df_farm_phylum_abs %>%
+  group_by(phylum_group) %>%
+  arrange(desc(farm_specific_label), .by_group = TRUE) %>%
+  mutate(
+    y_center = cumsum(n) - n / 2,
+    x_num = as.numeric(phylum_group)
+  ) %>%
+  ungroup()
+
+# Labeling rule: low-count segments outside with connector lines
+label_threshold <- 6
+label_df_farm_low <- label_df_farm %>%
+  filter(n > 0, n < label_threshold)
+label_df_farm_high <- label_df_farm %>%
+  filter(n >= label_threshold)
+
+plot_farm_phylum_abs <- ggplot(
+  df_farm_phylum_abs,
+  aes(x = phylum_group, y = n, fill = farm_specific_label)
+) +
+  geom_col(position = "stack", color = "black", width = 0.55) +
+  geom_segment(
+    data = label_df_farm_low,
+    aes(x = x_num + 0.27, xend = x_num + 0.36, y = y_center, yend = y_center),
+    inherit.aes = FALSE,
+    color = "black",
+    linewidth = 0.3
+  ) +
+  geom_text(
+    data = label_df_farm_low,
+    aes(x = x_num + 0.39, y = y_center, label = if_else(n > 0, as.character(n), "")),
+    inherit.aes = FALSE,
+    size = 3,
+    color = "black",
+    fontface = "bold",
+    hjust = 0
+  ) +
+  geom_text(
+    data = label_df_farm_high,
+    aes(x = phylum_group, y = y_center, label = as.character(n)),
+    inherit.aes = FALSE,
+    size = 3,
+    color = "black",
+    fontface = "bold"
+  ) +
+  scale_fill_manual(
+    values = c("Non-farm-specific" = "#2E86C1", "Farm-specific" = "#F28E2B"),
+    name = "Farm Specificity"
+  ) +
+  labs(
+    x = "Phylum",
+    y = "Number of SGBs",
+    #title = "Farm Specificity Across Phyla (Absolute Counts)"
+  ) +
+  my_theme() +
+  coord_cartesian(clip = "off") +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "top",
+    plot.margin = margin(5.5, 35, 5.5, 5.5)
+  )+
+  theme_publication()+
+  theme(
+    legend.title = element_blank(),
+    legend.position = c(0.75, 0.85),        # top-right inside plot
+    legend.background = element_rect(fill = alpha("white", 0.7), color = NA),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )+
+  xlab("")
+
+print(plot_farm_phylum_abs)
+
+ggsave(
+  "../figures/farm_specificity_phyla_absolute_stacked.svg",
+  plot = plot_farm_phylum_abs,
+  width = 5,
+  height = 6,
+  dpi = 300,
+  web_fonts = "DeJaVu Sans"
+)
+```
+
+### Q2c: Host specificity across phyla (absolute counts)
+```{r}
+# Absolute stacked barplots across multiple phyla
+df_host_base <- df_gb %>%
+  filter(!is.na(host_specific), !is.na(phylum_simple)) %>%
+  mutate(
+    host_specific_label = if_else(host_specific, "Host-specific", "Non-host-specific")
+  )
+
+# Keep top 4 phyla by total count; collapse remaining to "Others" (5 groups total)
+top4_phyla_host <- df_host_base %>%
+  dplyr::count(phylum_simple, name = "total_n") %>%
+  arrange(desc(total_n)) %>%
+  slice_head(n = 4) %>%
+  pull(phylum_simple)
+
+df_host_phylum_abs <- df_host_base %>%
+  mutate(
+    phylum_group = if_else(phylum_simple %in% top4_phyla_host, phylum_simple, "Others")
+  ) %>%
+  dplyr::count(phylum_group, host_specific_label, name = "n")
+
+# Keep order: top 4 by abundance, then Others
+phylum_order_host <- c(top4_phyla_host, "Others")
+df_host_phylum_abs <- df_host_phylum_abs %>%
+  mutate(phylum_group = factor(phylum_group, levels = phylum_order_host))
+
+# Precompute label positions for outside labels with connector lines
+df_host_phylum_abs <- df_host_phylum_abs %>%
+  mutate(host_specific_label = factor(host_specific_label,
+                                      levels = c("Non-host-specific", "Host-specific")))
+
+label_df_host <- df_host_phylum_abs %>%
+  group_by(phylum_group) %>%
+  # Match ggplot stacking order used in geom_col for correct label y-positions
+  arrange(desc(host_specific_label), .by_group = TRUE) %>%
+  mutate(
+    y_center = cumsum(n) - n / 2,
+    x_num = as.numeric(phylum_group)
+  ) %>%
+  ungroup()
+
+# Labeling rule: low-count segments outside with connector lines
+label_threshold <- 6
+label_df_host_low <- label_df_host %>%
+  filter(n > 0, n < label_threshold)
+label_df_host_high <- label_df_host %>%
+  filter(n >= label_threshold)
+
+plot_host_phylum_abs <- ggplot(
+  df_host_phylum_abs,
+  aes(x = phylum_group, y = n, fill = host_specific_label)
+) +
+  geom_col(position = "stack", color = "black", width = 0.55) +
+  geom_segment(
+    data = label_df_host_low,
+    aes(x = x_num + 0.27, xend = x_num + 0.36, y = y_center, yend = y_center),
+    inherit.aes = FALSE,
+    color = "black",
+    linewidth = 0.3
+  ) +
+  geom_text(
+    data = label_df_host_low,
+    aes(x = x_num + 0.39, y = y_center, label = if_else(n > 0, as.character(n), "")),
+    inherit.aes = FALSE,
+    size = 3,
+    color = "black",
+    fontface = "bold",
+    hjust = 0
+  ) +
+  geom_text(
+    data = label_df_host_high,
+    aes(x = phylum_group, y = y_center, label = as.character(n)),
+    inherit.aes = FALSE,
+    size = 3,
+    color = "black",
+    fontface = "bold"
+  ) +
+  scale_fill_manual(
+    values = c("Non-host-specific" = "#2E86C1", "Host-specific" = "#E31A1C"),
+    name = "Host Specificity"
+  ) +
+  labs(
+    x = "Phylum",
+    y = "Number of SGBs",
+    #title = "Host Specificity Across Phyla"
+  ) +
+  my_theme() +
+  coord_cartesian(clip = "off") +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "top",
+    plot.margin = margin(5.5, 35, 5.5, 5.5)
+  )+
+  theme_publication()+
+   theme(
+    legend.title = element_blank(),
+    legend.position = c(0.75, 0.85),        # top-right inside plot
+    legend.background = element_rect(fill = alpha("white", 0.7), color = NA),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )+
+  xlab("")
+  
+
+print(plot_host_phylum_abs)
+
+ggsave(
+  "../figures/host_specificity_phyla_absolute_stacked.svg",
+  plot = plot_host_phylum_abs,
+  width = 5,
+  height = 6,
+  dpi = 300,
+  web_fonts = "DeJaVu Sans"
+)
+```
+
+### Q3: Firmicutes are more individualized than Bacteroidota (excluding host-specific)
+```{r}
+df_indiv_compare <- df_gb %>%
+  filter(host_specific == FALSE) %>%
+  filter(!is.na(median_min)) %>%
+  filter(phylum_simple %in% c("Firmicutes", "Bacteroidota"))
+
+wilcox_indiv_phylum <- tryCatch(
+  wilcox.test(median_min ~ phylum_simple, data = df_indiv_compare),
+  error = function(e) NA
+)
+wilcox_indiv_phylum
+
+p.val <- wilcox_indiv_phylum$p.value
+
+plot_indiv_phylum <- ggplot(df_indiv_compare, aes(x = phylum_simple, y = median_min, fill = phylum_simple)) +
+  geom_boxplot(outlier.alpha = 0.3, width = 0.3) +
+  geom_jitter(width = 0.1, alpha = 0.5 )+
+  my_theme() +
+  annotate("text", x = 1.5, y = max(df_indiv_compare$median_min)*1.05,
+           label = paste("Wilcoxon p=", round(p.val, 3)), size = 6)+
+  labs(x = "", y = "Individualization score (median_min)",
+       #title = "Individualization by phylum (non-host-specific)"
+       ) +
+  theme(legend.position = "none")+
+  scale_fill_brewer()+
+  theme_publication()+
+  theme(
+    legend.position = "none"
+  )
+
+
+print(plot_indiv_phylum)
+
+# ggsave
+ggsave("../figures/individualization_non_host_specific.svg", plot = plot_indiv_phylum, width = 6, height = 6, web_fonts = "DeJaVu Sans")
+```
+
+### Q4: Prevotella vs other Bacteroidota families
+```{r}
+df_prevotella <- df_gb %>%
+  filter(phylum_simple == "Bacteroidota") %>%
+  mutate(
+    prevotella_group = case_when(
+      !is.na(Genus) & str_detect(tolower(Genus), "prevotella") ~ "Prevotella",
+      !is.na(Family) & str_detect(tolower(Family), "prevotell") ~ "Prevotella",
+      TRUE ~ "Other_Bacteroidota"
+    )
+  )
+
+tab_prev_host <- table(df_prevotella$prevotella_group, df_prevotella$host_ambivalent)
+fisher_prev_host <- tryCatch(fisher.test(tab_prev_host), error = function(e) NA)
+fisher_prev_host
+
+tab_prev_farm <- table(df_prevotella$prevotella_group, df_prevotella$farm_specific)
+fisher_prev_farm <- tryCatch(fisher.test(tab_prev_farm), error = function(e) NA)
+fisher_prev_farm
+
+wilcox_prev_indiv <- tryCatch(
+  wilcox.test(median_min ~ prevotella_group, data = df_prevotella),
+  error = function(e) NA
+)
+wilcox_prev_indiv
+
+plot_prev_indiv <- ggplot(df_prevotella, aes(x = prevotella_group, y = median_min, fill = prevotella_group)) +
+  geom_boxplot(outlier.alpha = 0.3, width = 0.3) +
+  geom_jitter(alpha = 0.5, width = 0.1)+
+  my_theme() +
+  annotate("text", x = 1.5, y = max(df_indiv_compare$median_min)*1.05,
+           label = paste("Wilcoxon p=", round(wilcox_prev_indiv$p.value, 3)), size = 6)+
+  labs(x = "", y = "Individualization score (median_min)",
+       #title = "Prevotella vs other Bacteroidota"
+       ) +
+  theme_publication()+
+  theme(legend.position = "none")+
+  scale_fill_brewer(palette = 4)
+
+print(plot_prev_indiv)
+
+# ggsave
+ggsave("../figures/individualization_prevotella_vs_other_Bact.svg",
+       plot = plot_prev_indiv,
+       width = 6, height = 6,
+       web_fonts = "DeJaVu Sans")
+```
+
+
+
